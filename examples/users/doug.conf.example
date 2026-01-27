@@ -1,0 +1,47 @@
+# =============================================================================
+# Per-User PAM SSH 2FA Configuration
+# =============================================================================
+#
+# This file configures notifications for a specific user.
+# Location: /etc/pam-ssh-2fa/users/<username>.conf
+#
+# Only certain sections are used from per-user configs:
+#   [notifications] - Notification URLs and templates
+#   [auth] - Authentication method
+#
+# All other settings come from the main /etc/pam-ssh-2fa/config.ini
+#
+# This example is for a user who prefers Pushover with link-based auth.
+#
+# SETUP:
+# 1. Copy this file: sudo cp doug.conf.example /etc/pam-ssh-2fa/users/doug.conf
+# 2. Edit with your Pushover credentials
+# 3. Set permissions: sudo chmod 600 /etc/pam-ssh-2fa/users/doug.conf
+#
+# =============================================================================
+
+[notifications]
+
+# Pushover notification URL
+# Format: pover://USER_KEY@APP_TOKEN
+#
+# Get your credentials at https://pushover.net:
+#   - User Key: Found in your Pushover dashboard (top right)
+#   - App Token: Create an application, get its API Token/Key
+#
+apprise_urls = pover://YOUR_USER_KEY@YOUR_APP_TOKEN
+
+
+[auth]
+
+# Authentication method for this user
+#
+# Options:
+#   code - Send a 4-digit code, user types it in
+#   link - Send an approval link, user clicks it (no typing!)
+#   both - Send both, user can type code OR click link then press Enter
+#   none - Skip 2FA entirely for this user
+#
+# Pushover supports clickable links, so "link" or "both" work great.
+#
+method = link

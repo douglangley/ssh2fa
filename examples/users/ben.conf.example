@@ -1,0 +1,57 @@
+# =============================================================================
+# Per-User PAM SSH 2FA Configuration
+# =============================================================================
+#
+# This file configures notifications for a specific user.
+# Location: /etc/pam-ssh-2fa/users/<username>.conf
+#
+# Only certain sections are used from per-user configs:
+#   [notifications] - Notification URLs and templates
+#   [auth] - Authentication method
+#
+# All other settings come from the main /etc/pam-ssh-2fa/config.ini
+#
+# This example is for a user who prefers ntfy with code-based auth.
+#
+# SETUP:
+# 1. Copy this file: sudo cp ben.conf.example /etc/pam-ssh-2fa/users/ben.conf
+# 2. Edit with your ntfy topic name
+# 3. Set permissions: sudo chmod 600 /etc/pam-ssh-2fa/users/ben.conf
+#
+# =============================================================================
+
+[notifications]
+
+# ntfy notification URL
+#
+# Public ntfy.sh (free, no account needed):
+#   ntfy://ntfy.sh/your-secret-topic-name
+#
+# Self-hosted ntfy:
+#   ntfy://your-server.com/your-topic
+#   ntfys://your-server.com/your-topic  (for HTTPS)
+#
+# With authentication:
+#   ntfys://user:password@your-server.com/your-topic
+#
+# SECURITY NOTE: Anyone who knows your topic name can subscribe to it
+# on the public ntfy.sh server. Use a long random string for the topic,
+# or self-host ntfy for private notifications.
+#
+apprise_urls = ntfy://ntfy.sh/ben-ssh-codes-RANDOMSTRING123
+
+
+[auth]
+
+# Authentication method for this user
+#
+# Options:
+#   code - Send a 4-digit code, user types it in
+#   link - Send an approval link, user clicks it (no typing!)
+#   both - Send both, user can type code OR click link then press Enter
+#   none - Skip 2FA entirely for this user
+#
+# ntfy supports clickable links, so all methods work.
+# Using "both" gives the user flexibility.
+#
+method = both

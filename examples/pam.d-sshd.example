@@ -1,0 +1,119 @@
+# =============================================================================
+# PAM SSH 2FA - Example PAM Configuration for /etc/pam.d/sshd
+# =============================================================================
+#
+# This file shows what changes to make to /etc/pam.d/sshd to enable 2FA.
+# DO NOT replace your entire sshd PAM config with this file!
+# Instead, add the relevant line to your existing config.
+#
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# OPTION 1: Add 2FA after password authentication
+# -----------------------------------------------------------------------------
+# 
+# This requires: SSH key + 2FA code
+# The user authenticates with their SSH key first, then enters the 2FA code.
+#
+# Add this line AFTER "@include common-auth" in /etc/pam.d/sshd:
+#
+#   auth required pam_python.so /etc/pam-ssh-2fa/pam_ssh_2fa.py
+#
+# Your /etc/pam.d/sshd should look something like:
+#
+#   # PAM configuration for the Secure Shell service
+#   @include common-auth
+#   auth required pam_python.so /etc/pam-ssh-2fa/pam_ssh_2fa.py
+#   ... (rest of file)
+#
+
+# -----------------------------------------------------------------------------
+# OPTION 2: Make 2FA optional (soft fail)
+# -----------------------------------------------------------------------------
+#
+# If 2FA fails (e.g., notification service down), allow login anyway.
+# Less secure but prevents lockouts.
+#
+#   auth optional pam_python.so /etc/pam-ssh-2fa/pam_ssh_2fa.py
+#
+
+# -----------------------------------------------------------------------------
+# OPTION 3: 2FA only for certain users (via PAM succeed_if)
+# -----------------------------------------------------------------------------
+#
+# Only require 2FA for users in the "require2fa" group:
+#
+#   auth [success=1 default=ignore] pam_succeed_if.so user notingroup require2fa
+#   auth required pam_python.so /etc/pam-ssh-2fa/pam_ssh_2fa.py
+#
+
+# -----------------------------------------------------------------------------
+# COMPLETE EXAMPLE /etc/pam.d/sshd
+# -----------------------------------------------------------------------------
+#
+# This is what a typical Debian/Ubuntu sshd PAM config looks like with 2FA added:
+#
+# --- BEGIN EXAMPLE ---
+
+# PAM configuration for the Secure Shell service
+
+# Standard Un*x authentication.
+@include common-auth
+
+# === PAM SSH 2FA ===
+# Require 2FA code after key/password authentication
+auth required pam_python.so /etc/pam-ssh-2fa/pam_ssh_2fa.py
+# === END PAM SSH 2FA ===
+
+# Disallow non-root logins when /etc/nologin exists.
+account    required     pam_nologin.so
+
+# Uncomment and edit /etc/security/access.conf if you need to set complex
+# access limits that are hard to express in sshd_config.
+# account  required     pam_access.so
+
+# Standard Un*x authorization.
+@include common-account
+
+# SELinux needs to be the first session rule.  This ensures that any
+# lingering context has been cleared.  Without this it is possible that a
+# module could execute code in the wrong domain.
+session [success=ok ignore=ignore module_unknown=ignore default=bad]        pam_selinux.so close
+
+# Set the loginuid process attribute.
+session    required     pam_loginuid.so
+
+# Create a new session keyring.
+session    optional     pam_keyinit.so force revoke
+
+# Standard Un*x session setup and teardown.
+@include common-session
+
+# Print the message of the day upon successful login.
+# This includes a dynamically generated part from /run/motd.dynamic
+# and a static (admin-editable) part from /etc/motd.
+session    optional     pam_motd.so  motd=/run/motd.dynamic
+session    optional     pam_motd.so noupdate
+
+# Print the status of the user's mailbox upon successful login.
+session    optional     pam_mail.so standard noenv # [1]
+
+# Set up user limits from /etc/security/limits.conf.
+session    required     pam_limits.so
+
+# Read environment variables from /etc/environment and
+# /etc/security/pam_env.conf.
+session    required     pam_env.so # [1]
+# In Debian 4.0 (etch), locale-related environment variables were moved to
+# /etc/default/locale, so read that as well.
+session    required     pam_env.so user_readenv=1 envfile=/etc/default/locale
+
+# SELinux needs to intervene at login time to ensure that the process starts
+# in the proper default security context.  Only sessions which are intended
+# to run in the user's context should be run after this.
+session [success=ok ignore=ignore module_unknown=ignore default=bad]        pam_selinux.so open
+
+# Standard Un*x password updating.
+@include common-password
+
+# --- END EXAMPLE ---

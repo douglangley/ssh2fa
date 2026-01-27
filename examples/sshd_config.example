@@ -1,0 +1,137 @@
+# =============================================================================
+# PAM SSH 2FA - Example SSH Configuration for /etc/ssh/sshd_config
+# =============================================================================
+#
+# This file shows what changes to make to /etc/ssh/sshd_config to enable 2FA.
+# DO NOT replace your entire sshd_config with this file!
+# Instead, modify or add the relevant settings in your existing config.
+#
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# REQUIRED SETTINGS
+# -----------------------------------------------------------------------------
+
+# Enable PAM (Pluggable Authentication Modules)
+# This is required for the 2FA module to work
+UsePAM yes
+
+# Enable keyboard-interactive authentication
+# This allows PAM to prompt for the 2FA code
+# On Ubuntu 22.04+ / Debian 12+, use KbdInteractiveAuthentication
+# On older systems, use ChallengeResponseAuthentication
+KbdInteractiveAuthentication yes
+# ChallengeResponseAuthentication yes  # For older systems
+
+# Specify the authentication methods required
+# This example requires: SSH key THEN 2FA code
+# The comma between methods means BOTH are required in sequence
+AuthenticationMethods publickey,keyboard-interactive:pam
+
+
+# -----------------------------------------------------------------------------
+# RECOMMENDED SETTINGS
+# -----------------------------------------------------------------------------
+
+# Disable password authentication (use SSH keys instead)
+# This prevents brute force password attacks
+PasswordAuthentication no
+
+# Disable DNS lookups for connecting clients
+# Speeds up connections and ensures PAM sees IP, not hostname
+UseDNS no
+
+
+# -----------------------------------------------------------------------------
+# ALTERNATIVE AUTHENTICATION CONFIGURATIONS
+# -----------------------------------------------------------------------------
+
+# OPTION 1: Require SSH key + 2FA for all users (most secure)
+# AuthenticationMethods publickey,keyboard-interactive:pam
+
+# OPTION 2: Require EITHER (SSH key + 2FA) OR (password + 2FA)
+# Space between options means OR
+# AuthenticationMethods publickey,keyboard-interactive:pam keyboard-interactive:pam
+
+# OPTION 3: Different requirements for different users
+# Admins need key + 2FA, others need just key
+# Match User admin*
+#     AuthenticationMethods publickey,keyboard-interactive:pam
+# Match User *
+#     AuthenticationMethods publickey
+
+# OPTION 4: Skip 2FA from trusted networks
+# Match Address 192.168.1.0/24,10.0.0.0/8
+#     AuthenticationMethods publickey
+# Match Address *
+#     AuthenticationMethods publickey,keyboard-interactive:pam
+
+
+# -----------------------------------------------------------------------------
+# COMPLETE EXAMPLE CONFIGURATION SNIPPET
+# -----------------------------------------------------------------------------
+#
+# Add or modify these settings in your /etc/ssh/sshd_config:
+#
+
+# === PAM SSH 2FA Settings ===
+
+# Enable PAM
+UsePAM yes
+
+# Enable keyboard-interactive for PAM prompts
+KbdInteractiveAuthentication yes
+
+# Require SSH key + 2FA code
+AuthenticationMethods publickey,keyboard-interactive:pam
+
+# Disable plain password auth (use keys instead)
+PasswordAuthentication no
+
+# Speed up connections
+UseDNS no
+
+# === End PAM SSH 2FA Settings ===
+
+
+# -----------------------------------------------------------------------------
+# TESTING YOUR CONFIGURATION
+# -----------------------------------------------------------------------------
+#
+# Before restarting SSH:
+#
+# 1. Check config syntax:
+#    sudo sshd -t
+#
+# 2. Test in debug mode (in a separate window):
+#    sudo /usr/sbin/sshd -d -p 2222
+#    Then connect: ssh -p 2222 user@localhost
+#
+# 3. Keep your current SSH session open!
+#    Never close your session until you've verified you can connect.
+#
+# 4. Restart SSH:
+#    sudo systemctl restart sshd
+#
+
+
+# -----------------------------------------------------------------------------
+# TROUBLESHOOTING
+# -----------------------------------------------------------------------------
+#
+# If you get locked out:
+# - Use console access (IPMI, serial, cloud console)
+# - Comment out the AuthenticationMethods line
+# - Restart sshd
+# - Debug the issue
+#
+# If 2FA prompt doesn't appear:
+# - Verify KbdInteractiveAuthentication yes is set
+# - Check PAM config has the module line
+# - Look at logs: journalctl -u sshd -f
+#
+# If you see "Permission denied (publickey)":
+# - Your SSH key isn't being accepted
+# - Check ~/.ssh/authorized_keys permissions
+# - Ensure PubkeyAuthentication yes (usually default)
+#
