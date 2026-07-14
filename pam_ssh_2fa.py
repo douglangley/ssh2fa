@@ -4,13 +4,13 @@ PAM SSH 2FA Module - Push Notification One-Time Password Authentication
 ========================================================================
 
 This module provides two-factor authentication for SSH by generating a
-random 4-digit code, sending it via push notification (using Apprise),
-and prompting the user to enter the code.
+random code (6 digits by default, configurable), sending it via push
+notification (using Apprise), and prompting the user to enter the code.
 
 OVERVIEW
 --------
 When a user attempts to authenticate via SSH, this module:
-1. Generates a cryptographically secure 4-digit code
+1. Generates a cryptographically secure code
 2. Sends that code to the user via configured notification service(s)
 3. Prompts the user to enter the received code
 4. Validates the entered code against the generated one
@@ -86,6 +86,7 @@ import logging
 import json
 import hashlib
 import tempfile
+import fcntl
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, Tuple, Dict, Any
@@ -107,9 +108,15 @@ except ImportError:
 # Default configuration file location
 CONFIG_FILE = "/etc/pam-ssh-2fa/config.ini"
 
+# Valid range for the configurable OTP code length. Below 6 digits a code
+# is brute-forceable within a handful of guessing windows; above 10 it
+# stops being practical to read off a push notification and type in.
+CODE_LENGTH_MIN = 6
+CODE_LENGTH_MAX = 10
+
 # Default values if config file is missing or incomplete
 DEFAULTS = {
-    "code_length": 4,  # Length of the OTP code
+    "code_length": 6,  # Length of the OTP code (configurable, see [codes] length)
     "code_timeout": 300,  # Seconds before code expires (5 minutes)
     "max_attempts": 3,  # Maximum entry attempts before failure
     "debug": False,  # Enable debug logging
@@ -125,12 +132,17 @@ DEFAULTS = {
     "success_message": "Verification successful.",
     "failure_message": "Verification failed.",
     "expired_message": "Code expired. Please reconnect to receive a new code.",
+    "ratelimit_message": "Too many attempts. Please wait a few minutes and try again.",
     "bypass_users": "",  # Comma-separated list of users to skip 2FA
     "bypass_networks": "",  # Comma-separated CIDR ranges to skip 2FA
     "allow_unconfigured_users": False,  # If True, users without config bypass 2FA
     "auth_method": "code",  # Default auth method: code, link, both, none
     "server_port": 9110,  # Approval server port
     "server_url": "",  # Approval server URL (e.g., http://myserver.com:9110)
+    "ratelimit_window": 300,  # Sliding window (seconds) for the two limits below
+    "ratelimit_max_per_user": 5,  # Max new requests per user within the window
+    "ratelimit_max_per_rhost": 15,  # Max new requests per source address within the window
+    "ratelimit_max_concurrent_per_user": 3,  # Max outstanding requests per user at once
 }
 
 # PAM return codes (defined here for clarity)
@@ -146,6 +158,37 @@ PAM_IGNORE = 25
 # approval tokens). One strict format used everywhere means a token is either
 # valid or rejected outright -- never silently rewritten to fit a filename.
 TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{32,128}")
+
+
+def _bounded_int(minimum: int, maximum: int):
+    """
+    Build a config-value converter that rejects out-of-range integers.
+
+    Used for security-relevant numeric settings (code length, rate
+    limits) so a typo or an overly permissive admin edit in config.ini
+    is rejected and falls back to the built-in default instead of
+    silently taking effect.
+
+    Args:
+        minimum: Smallest accepted value (inclusive)
+        maximum: Largest accepted value (inclusive)
+
+    Returns:
+        A function(str) -> int suitable for use as a section_mapping
+        converter. Raises ValueError for out-of-range or non-integer
+        input, which _parse_config_file() catches and treats as "keep
+        the default".
+    """
+
+    def convert(raw_value: str) -> int:
+        parsed = int(raw_value)
+        if not (minimum <= parsed <= maximum):
+            raise ValueError(
+                f"value {parsed} out of range [{minimum}, {maximum}]"
+            )
+        return parsed
+
+    return convert
 
 
 # =============================================================================
@@ -287,7 +330,7 @@ class Config:
         log_file = /var/log/pam-ssh-2fa.log
 
         [codes]
-        length = 4
+        length = 6
         timeout = 300
 
         [notifications]
@@ -392,7 +435,10 @@ class Config:
         section_mapping = {
             ("general", "debug"): ("debug", self._parse_bool),
             ("general", "log_file"): ("log_file", str),
-            ("codes", "length"): ("code_length", int),
+            ("codes", "length"): (
+                "code_length",
+                _bounded_int(CODE_LENGTH_MIN, CODE_LENGTH_MAX),
+            ),
             ("codes", "timeout"): ("code_timeout", int),
             ("codes", "max_attempts"): ("max_attempts", int),
             ("codes", "storage_dir"): ("code_storage_dir", str),
@@ -406,6 +452,7 @@ class Config:
             ("messages", "success"): ("success_message", str),
             ("messages", "failure"): ("failure_message", str),
             ("messages", "expired"): ("expired_message", str),
+            ("messages", "ratelimit"): ("ratelimit_message", str),
             ("bypass", "users"): ("bypass_users", str),
             ("bypass", "networks"): ("bypass_networks", str),
             ("users", "allow_unconfigured_users"): (
@@ -415,6 +462,19 @@ class Config:
             ("users", "auth_method"): ("auth_method", str),
             ("server", "port"): ("server_port", int),
             ("server", "url"): ("server_url", str),
+            ("ratelimit", "window"): ("ratelimit_window", _bounded_int(10, 86400)),
+            ("ratelimit", "max_per_user"): (
+                "ratelimit_max_per_user",
+                _bounded_int(1, 1000),
+            ),
+            ("ratelimit", "max_per_rhost"): (
+                "ratelimit_max_per_rhost",
+                _bounded_int(1, 1000),
+            ),
+            ("ratelimit", "max_concurrent_per_user"): (
+                "ratelimit_max_concurrent_per_user",
+                _bounded_int(1, 100),
+            ),
         }
 
         # User configs can only override notification settings
@@ -566,7 +626,7 @@ class CodeManager:
     def __init__(
         self,
         storage_dir: str,
-        code_length: int = 4,
+        code_length: int = 6,
         timeout: int = 300,
         max_attempts: int = 3,
         logger: Optional[PAMLogger] = None,
@@ -1489,6 +1549,204 @@ class BypassChecker:
 
 
 # =============================================================================
+# RATE LIMITING
+# =============================================================================
+
+
+class RateLimiter:
+    """
+    File-based request-rate and concurrency limiter shared across PAM
+    processes.
+
+    Every authentication attempt calls check_window() once per identity
+    (username, then source address) before any OTP code or approval is
+    generated and before any notification is sent, so a rate-limited
+    attempt never triggers a push notification or leaves state behind.
+    count_active() enforces a separate cap on how many of one user's
+    requests are outstanding at once.
+
+    Sliding-window state lives in one JSON file per identity, holding a
+    bounded list of recent Unix timestamps. An exclusive flock guards
+    the read-modify-write cycle around that file, so two PAM processes
+    racing to authenticate the same identity can't both read a stale
+    count and both be let through.
+
+    Attributes:
+        storage_dir (str): Directory for rate-limit counter files
+        logger (PAMLogger): Optional logger for debugging
+
+    Usage:
+        limiter = RateLimiter("/var/run/pam-ssh-2fa/ratelimit", logger=logger)
+        allowed, retry_after = limiter.check_window("user", "john", 300, 5)
+        if not allowed:
+            ...  # deny, tell the user to wait retry_after seconds
+    """
+
+    def __init__(self, storage_dir: str, logger: Optional[PAMLogger] = None):
+        """
+        Initialize the rate limiter.
+
+        Args:
+            storage_dir: Directory to store per-identity counter files
+            logger: Optional logger for debug output
+        """
+        self.storage_dir = storage_dir
+        self.logger = logger
+        self._ensure_dir()
+
+    def _ensure_dir(self):
+        """Create the counter storage directory with secure permissions."""
+        if not os.path.exists(self.storage_dir):
+            try:
+                os.makedirs(self.storage_dir, mode=0o700)
+            except OSError as e:
+                if self.logger:
+                    self.logger.error(f"Failed to create ratelimit dir: {e}")
+                raise
+        else:
+            try:
+                os.chmod(self.storage_dir, 0o700)
+            except OSError:
+                pass
+
+    def _state_file(self, kind: str, identity: str) -> str:
+        """
+        Get the counter file path for an identity.
+
+        The identity (a username or an IP address) is hashed rather
+        than used verbatim, consistent with how other state directories
+        in this module avoid leaking usernames via directory listings.
+
+        Args:
+            kind: Namespace for the identity, e.g. "user" or "rhost"
+            identity: The value being rate limited
+
+        Returns:
+            Full path to the counter file
+        """
+        digest = hashlib.sha256(f"{kind}:{identity}".encode()).hexdigest()[:16]
+        return os.path.join(self.storage_dir, f"{kind}_{digest}.json")
+
+    def check_window(
+        self,
+        kind: str,
+        identity: str,
+        window_seconds: int,
+        max_events: int,
+        now: Optional[float] = None,
+    ) -> Tuple[bool, int]:
+        """
+        Atomically check and record one event against a sliding window.
+
+        Args:
+            kind: Namespace for the identity, e.g. "user" or "rhost"
+            identity: The value being rate limited
+            window_seconds: Width of the sliding window in seconds
+            max_events: Maximum events allowed inside the window
+            now: Override for the current time (used by tests)
+
+        Returns:
+            Tuple of (allowed, retry_after_seconds). If allowed is
+            False, the event was NOT recorded -- the caller must not
+            proceed with the action being limited.
+        """
+        now = now if now is not None else time.time()
+        path = self._state_file(kind, identity)
+
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                raw = os.read(fd, 1 << 16)
+                try:
+                    events = json.loads(raw.decode("utf-8")) if raw else []
+                    if not isinstance(events, list):
+                        events = []
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    events = []
+
+                cutoff = now - window_seconds
+                events = [
+                    t for t in events if isinstance(t, (int, float)) and t > cutoff
+                ]
+
+                if len(events) >= max_events:
+                    retry_after = max(1, int(min(events) + window_seconds - now) + 1)
+                    if self.logger:
+                        self.logger.debug(
+                            "Rate limit window full",
+                            kind=kind,
+                            count=len(events),
+                            max_events=max_events,
+                            retry_after=retry_after,
+                        )
+                    return False, retry_after
+
+                events.append(now)
+
+                encoded = json.dumps(events).encode("utf-8")
+                os.lseek(fd, 0, os.SEEK_SET)
+                os.ftruncate(fd, 0)
+                os.write(fd, encoded)
+                return True, 0
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def count_active(
+        self, directory: str, prefix: str, user: str, now: Optional[float] = None
+    ) -> int:
+        """
+        Count non-expired request state files belonging to a user.
+
+        Scans an existing OTP or approval storage directory rather than
+        keeping a separate counter, so the count is always consistent
+        with what's actually outstanding -- it can't drift the way a
+        manually incremented/decremented counter could if a code is
+        never explicitly cleaned up (e.g. the SSH client disconnects).
+
+        Args:
+            directory: Directory containing JSON state files (code or
+                approval storage)
+            prefix: Only filenames starting with this prefix are
+                considered (e.g. "code_"; use "" for approval files)
+            user: Username to match against each file's "user" field
+            now: Override for the current time (used by tests)
+
+        Returns:
+            Number of matching, unexpired files found. Best-effort --
+            unreadable or corrupt files are skipped, not counted.
+        """
+        now = now if now is not None else time.time()
+        if not os.path.isdir(directory):
+            return 0
+
+        try:
+            entries = os.listdir(directory)
+        except OSError:
+            return 0
+
+        count = 0
+        for filename in entries:
+            if not filename.startswith(prefix) or not filename.endswith(".json"):
+                continue
+            filepath = os.path.join(directory, filename)
+            try:
+                with open(filepath, "r") as f:
+                    data = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+            if data.get("user") != user:
+                continue
+            if now > data.get("expires", 0):
+                continue
+            count += 1
+
+        return count
+
+
+# =============================================================================
 # PAM CONVERSATION HELPER
 # =============================================================================
 
@@ -1578,10 +1836,11 @@ def pam_sm_authenticate(pamh, flags, argv):
     1. Load configuration
     2. Get user and remote host info
     3. Check bypass conditions
-    4. Generate and send OTP code
-    5. Prompt user for code
-    6. Validate response
-    7. Return success or failure
+    4. Check per-user/per-source/concurrency rate limits
+    5. Generate and send OTP code
+    6. Prompt user for code
+    7. Validate response
+    8. Return success or failure
 
     Args:
         pamh: PAM handle with user info and conversation functions
@@ -1593,6 +1852,8 @@ def pam_sm_authenticate(pamh, flags, argv):
         PAM_AUTH_ERR: Authentication failed
         PAM_AUTHINFO_UNAVAIL: Could not send notification
         PAM_IGNORE: 2FA bypassed (user/network in bypass list)
+        PAM_MAXTRIES: Rate limit exceeded (per-user, per-source, or too
+            many concurrent pending requests)
     """
     # -------------------------------------------------------------------------
     # Step 1: Load configuration
@@ -1698,6 +1959,71 @@ def pam_sm_authenticate(pamh, flags, argv):
         return PAM_SUCCESS
 
     # -------------------------------------------------------------------------
+    # Step 4.5: Rate limiting
+    # -------------------------------------------------------------------------
+    # Gate here, before any code/approval state is created and before any
+    # notification is sent, so a rate-limited attempt never causes a push
+    # notification or consumes storage. One notification is sent per
+    # allowed request, so limiting request creation also bounds
+    # notification volume -- there is no separate cooldown to configure.
+    code_storage_dir = config.get("code_storage_dir", "/var/run/pam-ssh-2fa")
+    ratelimit_message = config.get(
+        "ratelimit_message", "Too many attempts. Please wait a few minutes and try again."
+    )
+    rate_limiter = RateLimiter(
+        storage_dir=os.path.join(code_storage_dir, "ratelimit"), logger=logger
+    )
+
+    allowed, retry_after = rate_limiter.check_window(
+        "user",
+        user,
+        config.get("ratelimit_window", 300),
+        config.get("ratelimit_max_per_user", 5),
+    )
+    if not allowed:
+        logger.warning(
+            "Rate limit exceeded for user",
+            user=user,
+            rhost=rhost,
+            retry_after=retry_after,
+        )
+        pam_error(pamh, ratelimit_message)
+        return PAM_MAXTRIES
+
+    allowed, retry_after = rate_limiter.check_window(
+        "rhost",
+        rhost,
+        config.get("ratelimit_window", 300),
+        config.get("ratelimit_max_per_rhost", 15),
+    )
+    if not allowed:
+        logger.warning(
+            "Rate limit exceeded for source address",
+            user=user,
+            rhost=rhost,
+            retry_after=retry_after,
+        )
+        pam_error(pamh, ratelimit_message)
+        return PAM_MAXTRIES
+
+    max_concurrent = config.get("ratelimit_max_concurrent_per_user", 3)
+    pending = rate_limiter.count_active(
+        code_storage_dir, "code_", user
+    ) + rate_limiter.count_active(
+        os.path.join(code_storage_dir, "approvals"), "", user
+    )
+    if pending >= max_concurrent:
+        logger.warning(
+            "Too many concurrent pending requests",
+            user=user,
+            rhost=rhost,
+            pending=pending,
+            max_concurrent=max_concurrent,
+        )
+        pam_error(pamh, ratelimit_message)
+        return PAM_MAXTRIES
+
+    # -------------------------------------------------------------------------
     # Step 5: Setup managers and generate credentials
     # -------------------------------------------------------------------------
     code_timeout = config.get("code_timeout", 300)
@@ -1710,8 +2036,8 @@ def pam_sm_authenticate(pamh, flags, argv):
     code_manager = None
     if auth_method in ("code", "both"):
         code_manager = CodeManager(
-            storage_dir=config.get("code_storage_dir", "/var/run/pam-ssh-2fa"),
-            code_length=config.get("code_length", 4),
+            storage_dir=code_storage_dir,
+            code_length=config.get("code_length", 6),
             timeout=code_timeout,
             max_attempts=config.get("max_attempts", 3),
             logger=logger,
@@ -1736,9 +2062,7 @@ def pam_sm_authenticate(pamh, flags, argv):
             )
             return PAM_AUTHINFO_UNAVAIL
 
-        approvals_dir = os.path.join(
-            config.get("code_storage_dir", "/var/run/pam-ssh-2fa"), "approvals"
-        )
+        approvals_dir = os.path.join(code_storage_dir, "approvals")
 
         approval_manager = ApprovalManager(
             approvals_dir=approvals_dir,
@@ -2095,7 +2419,7 @@ if __name__ == "__main__":
     try:
         code_manager = CodeManager(
             storage_dir="/tmp/pam-ssh-2fa-test",
-            code_length=4,
+            code_length=6,
             timeout=60,
             max_attempts=3,
             logger=logger,

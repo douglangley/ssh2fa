@@ -7,7 +7,7 @@ A PAM (Pluggable Authentication Module) for SSH that sends one-time verification
 ### Code-Based Authentication (Default)
 
 1. User connects via SSH (with SSH key authentication)
-2. PAM module generates a random 4-digit code
+2. PAM module generates a random code (6 digits by default, configurable)
 3. Code is sent to user's phone/device via push notification
 4. User enters the code at the SSH prompt
 5. Access is granted if the code is correct
@@ -15,11 +15,11 @@ A PAM (Pluggable Authentication Module) for SSH that sends one-time verification
 ```
 +----------+     SSH Key     +----------+     Push     +----------+
 |  User    | --------------> |  Server  | -----------> |  Phone   |
-|          |                 |  (PAM)   |    "1234"    |          |
+|          |                 |  (PAM)   |   "123456"   |          |
 |          | <-------------- |          |              |          |
 |          |  Enter Code:    |          |              |          |
 |          | --------------> |          |              |          |
-|          |     "1234"      |          |              |          |
+|          |    "123456"     |          |              |          |
 |          | <-------------- |          |              |          |
 |          |   Access OK     |          |              |          |
 +----------+                 +----------+              +----------+
@@ -64,14 +64,14 @@ This module supports four authentication methods, configurable per-user:
 
 | Method | Description | User Experience |
 |--------|-------------|-----------------|
-| `code` | Send a 4-digit code | User types the code |
+| `code` | Send a code (6 digits by default, configurable) | User types the code |
 | `link` | Send an approval link | User opens the link and confirms on phone |
-| `both` | Send code AND link | User can type code OR click link then press Enter |
+| `both` | Send code AND link | User can type code OR open the link then press Enter |
 | `none` | Skip 2FA | No verification required |
 
 ### Link-Based Authentication
 
-For users who prefer not to type codes, link-based auth lets them simply click a link in the notification. This requires running the approval server.
+For users who prefer not to type codes, link-based auth lets them open a link in the notification and tap a confirmation button. This requires running the approval server.
 
 **Setup:**
 
@@ -338,7 +338,7 @@ All settings are in `/etc/pam-ssh-2fa/config.ini`:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `length` | `4` | Number of digits in code |
+| `length` | `6` | Number of digits in code. Valid range 6-10; an out-of-range or non-numeric value is rejected and the default is used |
 | `timeout` | `300` | Seconds until code/link expires |
 | `max_attempts` | `3` | Failed attempts before lockout |
 | `storage_dir` | `/var/run/pam-ssh-2fa` | Temporary code storage |
@@ -364,6 +364,27 @@ Template variables: `{code}`, `{link}`, `{user}`, `{host}`, `{rhost}`, `{timeout
 | `success` | `Verification successful.` | Success message |
 | `failure` | `Verification failed.` | Failure message |
 | `expired` | `Code expired...` | Expiration message |
+| `ratelimit` | `Too many attempts...` | Shown when a [ratelimit] limit below is hit |
+
+### [ratelimit]
+
+Limits how often new codes/approval links can be requested, checked before any code is generated or notification sent. One notification is sent per allowed request, so this also bounds notification volume -- there's no separate cooldown setting.
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `window` | `300` | Sliding window in seconds that the two limits below apply to. Valid range 10-86400 |
+| `max_per_user` | `5` | Max new requests one username may create within the window. Valid range 1-1000 |
+| `max_per_rhost` | `15` | Max new requests one source address may create within the window, across all usernames. Valid range 1-1000 |
+| `max_concurrent_per_user` | `3` | Max requests for one username that may be outstanding (not yet expired/validated/approved) at once. Valid range 1-100 |
+
+Example:
+```ini
+[ratelimit]
+window = 300
+max_per_user = 5
+max_per_rhost = 15
+max_concurrent_per_user = 3
+```
 
 ### [bypass]
 
@@ -393,7 +414,7 @@ networks = 192.168.1.0/24, 10.0.0.0/8
 
 **auth_method** sets the default authentication method:
 
-- `code` - Send a 4-digit code, user types it in (default)
+- `code` - Send a code (length set by [codes] length, default 6 digits), user types it in (default)
 - `link` - Send an approval link; the user opens it and explicitly confirms
 - `both` - Send both code and link, user can use either
 - `none` - Skip 2FA entirely
@@ -453,8 +474,8 @@ method = link
 
 | Method | Description | When to Use |
 |--------|-------------|-------------|
-| `code` | 4-digit code | Default, works everywhere |
-| `link` | Click to approve | No typing, best UX |
+| `code` | 6-digit code (configurable) | Default, works everywhere |
+| `link` | Open link, tap to approve | No typing, best UX |
 | `both` | Code or link | Maximum flexibility |
 | `none` | Skip 2FA | Emergency/service accounts |
 

@@ -5,10 +5,11 @@
 This is a PAM (Pluggable Authentication Module) for SSH two-factor authentication using push notifications. Users receive a code or approval link via services like ntfy, Pushover, or Telegram.
 
 **Key Features:**
-- 4-digit OTP codes sent via push notification (80+ services via Apprise)
+- OTP codes (6 digits by default, configurable 6-10) sent via push notification (80+ services via Apprise)
 - Link-based approval (open a link and explicitly confirm, no code typing)
 - Per-user configuration (different services/methods per user)
 - Configurable bypass for users/networks
+- Rate limiting (per-user, per-source-address, and concurrent-request caps)
 
 ## File Structure
 
@@ -45,6 +46,7 @@ pam-ssh-2fa/
 | `ApprovalManager` | Create/check link-based approval requests |
 | `NotificationSender` | Send notifications via Apprise |
 | `BypassChecker` | Determine if 2FA should be skipped |
+| `RateLimiter` | Per-user/per-source/concurrency request limits |
 
 **PAM Entry Points:**
 
@@ -81,7 +83,8 @@ pam-ssh-2fa/
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
-| `/approve/<token>` | GET | Approve an authentication request |
+| `/approve/<token>` | GET | Display request details and confirmation form |
+| `/approve/<token>` | POST | Approve after explicit confirmation |
 | `/health` | GET | Health check (returns JSON) |
 | `/` | GET | Info page |
 
@@ -99,6 +102,7 @@ pam-ssh-2fa/
 | `[server]` | Approval server port and URL |
 | `[messages]` | User-facing prompts and messages |
 | `[bypass]` | Users and networks to skip 2FA |
+| `[ratelimit]` | Per-user/per-source/concurrency request limits |
 | `[users]` | Default auth method, unconfigured user handling |
 
 **Key Settings:**
@@ -109,7 +113,7 @@ debug = false
 log_file = /var/log/pam-ssh-2fa.log
 
 [codes]
-length = 4                              # OTP code length
+length = 6                              # OTP code length (valid range 6-10)
 timeout = 300                           # Seconds until expiry
 max_attempts = 3                        # Failed attempts before lockout
 storage_dir = /var/run/pam-ssh-2fa      # Runtime storage
@@ -136,6 +140,12 @@ expired = Code expired. Please reconnect.
 [bypass]
 users =                                 # Comma-separated usernames
 networks =                              # Comma-separated CIDR ranges
+
+[ratelimit]
+window = 300                            # Sliding window in seconds
+max_per_user = 5                        # Max new requests per user per window
+max_per_rhost = 15                      # Max new requests per source address per window
+max_concurrent_per_user = 3             # Max outstanding requests per user
 
 [users]
 allow_unconfigured_users = false        # true = bypass, false = deny
@@ -171,23 +181,25 @@ method = link    # code, link, both, none
 2. `pam_sm_authenticate()` called
 3. `BypassChecker` checks if user/network should skip 2FA
 4. `Config` loads user-specific settings
-5. `CodeManager.generate()` creates 4-digit code, saves to file
-6. `NotificationSender.send()` pushes code via Apprise
-7. User prompted for code
-8. `CodeManager.validate()` checks code (constant-time comparison)
-9. Return PAM_SUCCESS or PAM_AUTH_ERR
+5. `RateLimiter` checks per-user/per-source/concurrency limits
+6. `CodeManager.generate()` creates a code (6 digits by default) bound to a fresh per-attempt request ID, saves to file
+7. `NotificationSender.send()` pushes code via Apprise
+8. User prompted for code
+9. `CodeManager.validate()` checks code against that request ID (constant-time comparison)
+10. Return PAM_SUCCESS or PAM_AUTH_ERR
 
 ### Link-Based (auth_method = link)
 
 1. User connects via SSH with key
 2. `pam_sm_authenticate()` called
-3. `ApprovalManager.create_approval()` generates token, saves request file
-4. `NotificationSender.send()` pushes link via Apprise
-5. User shown "Waiting for approval..."
-6. PAM polls `ApprovalManager.is_approved()` every second
-7. User opens the link and taps the explicit approval button
-8. `approval_server.py` marks request approved
-9. PAM sees approval, returns PAM_SUCCESS
+3. `RateLimiter` checks per-user/per-source/concurrency limits
+4. `ApprovalManager.create_approval()` generates token, saves request file
+5. `NotificationSender.send()` pushes link via Apprise
+6. User shown "Waiting for approval..."
+7. PAM polls `ApprovalManager.is_approved()` every second
+8. User opens the link and taps the explicit approval button
+9. `approval_server.py` marks request approved
+10. PAM sees approval, returns PAM_SUCCESS
 
 ### Combined (auth_method = both)
 
@@ -232,40 +244,56 @@ method = link    # code, link, both, none
 
 ### Adding a New Config Option
 
-1. Add default value to `DEFAULTS` dict in pam_ssh_2fa.py (~line 109)
-2. Add to `section_mapping` in `Config._parse_config_file()` (~line 370)
-3. If per-user configurable, add to user_only mapping (~line 405)
-4. Add to config.ini with comments
-5. Update README.md Configuration Reference section
-6. Update this CLAUDE.md file
+1. Add default value to `DEFAULTS` dict in pam_ssh_2fa.py (~line 118)
+2. Add to `section_mapping` in `Config._parse_config_file()` (~line 435)
+3. If per-user configurable, add to the `user_only` mapping (~line 483)
+4. If numeric and security-relevant, validate with `_bounded_int(min, max)`
+   as the converter instead of the bare `int`/`str` type (see `code_length`
+   or the `ratelimit_*` settings for examples)
+5. Add to config.ini with comments
+6. Update README.md Configuration Reference section
+7. Update this CLAUDE.md file
 
 ### Adding a New Notification Template Variable
 
-1. Add to `template_vars` dict in `NotificationSender.send()` (~line 1235)
+1. Add to `template_vars` dict in `NotificationSender.send()` (~line 1360)
 2. Document in config.ini comments
 3. Update README.md template variables list
 
 ### Adding a New Auth Method
 
-1. Add to validation in `pam_sm_authenticate()` (~line 1633)
-2. Add handling logic in Step 7 section (~line 1738)
+1. Add to validation in `pam_sm_authenticate()` (~line 1949)
+2. Add handling logic in the Step 7 section (~line 2115)
 3. Update config.ini comments
 4. Update README.md Authentication Methods section
 5. Update per-user example configs
 
 ### Adding a New Bypass Condition
 
-1. Add check method to `BypassChecker` class (~line 1323)
+1. Add check method to `BypassChecker` class (~line 1479)
 2. Call from `should_bypass()` method
 3. Add config option following "Adding a New Config Option"
+
+### Adding a New Rate Limit
+
+1. Add default value to `DEFAULTS` in pam_ssh_2fa.py, and a `_bounded_int`
+   converter entry in `section_mapping` (see the existing `ratelimit_*`
+   settings for the pattern)
+2. Call `RateLimiter.check_window()` (sliding window) or
+   `count_active()` (concurrency cap) from Step 4.5 of
+   `pam_sm_authenticate()`, before any code/approval state is created
+3. Add to config.ini `[ratelimit]` with comments
+4. Update README.md Configuration Reference section
 
 ### Modifying Code Length
 
 1. Update `DEFAULTS["code_length"]` in pam_ssh_2fa.py
 2. Update `CodeManager.__init__()` default parameter
-3. Update config.ini `length = X`
-4. Update all documentation references (README, config comments)
-5. Update test code examples (test_notify.py, docstrings)
+3. Update `CODE_LENGTH_MIN`/`CODE_LENGTH_MAX` if the valid range itself
+   should change (these bound what config.ini can set -- see `_bounded_int`)
+4. Update config.ini `length = X`
+5. Update all documentation references (README, config comments)
+6. Update test code examples (test_notify.py, docstrings)
 
 ## Testing
 
