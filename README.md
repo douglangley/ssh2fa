@@ -75,11 +75,14 @@ For users who prefer not to type codes, link-based auth lets them open a link in
 
 **Setup:**
 
-1. Configure the server URL in config.ini:
+1. Configure the server URL in config.ini. Approval links are bearer
+   credentials, so a plain `http://` URL is only accepted automatically
+   for loopback/private/Tailscale-range addresses -- anything else must
+   use `https://` (see [HTTPS for the Approval Server](#https-for-the-approval-server)):
    ```ini
    [server]
    port = 9110
-   url = http://your-server.example.com:9110
+   url = https://your-server.example.com:9110
    ```
 
 2. Open the firewall port:
@@ -98,6 +101,26 @@ For users who prefer not to type codes, link-based auth lets them open a link in
    [auth]
    method = link
    ```
+
+### HTTPS for the Approval Server
+
+An approval link is a bearer credential: anyone who observes it in transit (a proxy, a shared WiFi network, a notification service that logs URLs) can approve the associated SSH login. Because of this, `pam_ssh_2fa.py` refuses to build a link with `http://` for a public host and denies authentication instead -- you'll see `server_url uses http:// for a public host` in the PAM log.
+
+`http://` is accepted automatically only when the URL's host is loopback, an RFC1918/private address, or a Tailscale-range address (`100.64.0.0/10`), since that traffic never leaves a trusted network. A `*.ts.net` Tailscale *hostname* does not qualify automatically -- it can't be verified as private without a DNS lookup, which this module deliberately never performs during authentication.
+
+Pick one:
+
+- **Reverse proxy (recommended for most setups)**: run the approval server on loopback or an internal address and put nginx/Caddy/etc. in front of it to terminate TLS. Set `url` to the proxy's public `https://` address.
+- **Native TLS**: set `tls_cert` and `tls_key` in `[server]` to a PEM certificate/key pair; the server will serve HTTPS directly with no proxy needed:
+  ```ini
+  [server]
+  url = https://your-server.example.com:9110
+  tls_cert = /etc/pam-ssh-2fa/tls/fullchain.pem
+  tls_key = /etc/pam-ssh-2fa/tls/privkey.pem
+  ```
+- **Tailscale**: point `url` at the raw tailnet IP over `http://` (allowed automatically), or run `tailscale cert your-node.tailnet-name.ts.net` to get a free certificate and use native TLS with the `*.ts.net` hostname.
+- **Private network only, no TLS available**: point `url` at a loopback/RFC1918 address reachable only from where users actually connect.
+- **Explicit override (not recommended)**: set `[server] allow_insecure_http = true` to send `http://` links to a public host anyway.
 
 ## Requirements
 
@@ -183,13 +206,18 @@ Edit `/etc/pam-ssh-2fa/config.ini`:
 ```ini
 [server]
 port = 9110
-url = http://YOUR_PUBLIC_IP_OR_HOSTNAME:9110
+url = https://YOUR_PUBLIC_IP_OR_HOSTNAME:9110
 ```
 
-The URL must be reachable from the user's phone. Options:
-- Public IP: `http://203.0.113.50:9110`
-- Public hostname: `http://ssh.example.com:9110`
-- Tailscale: `http://myserver.tailnet.ts.net:9110`
+The URL must be reachable from the user's phone. Approval links are
+bearer credentials, so `http://` is rejected by default unless the host
+is loopback, private, or a raw Tailscale IP -- see
+[HTTPS for the Approval Server](#https-for-the-approval-server) for how
+to add TLS (native `tls_cert`/`tls_key` or a reverse proxy). Options:
+- Public IP: `https://203.0.113.50:9110`
+- Public hostname: `https://ssh.example.com:9110`
+- Tailscale hostname: `https://myserver.tailnet.ts.net:9110` (needs `tailscale cert`)
+- Raw Tailscale IP: `http://100.101.102.103:9110` (allowed over plain HTTP)
 
 ### 2. Open Firewall
 
@@ -221,7 +249,7 @@ systemctl status pam-ssh-2fa-server
 curl http://localhost:9110/health
 
 # Test from external (from your phone's browser or another machine)
-curl http://YOUR_SERVER:9110/health
+curl https://YOUR_SERVER:9110/health
 ```
 
 ### 5. Configure Users for Link Auth
@@ -433,16 +461,20 @@ Required for link-based authentication (`auth_method = link` or `both`):
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `port` | `9110` | Port the approval server listens on |
-| `url` | (empty) | Public URL for approval links (REQUIRED for link auth) |
+| `url` | (empty) | Public URL for approval links (REQUIRED for link auth). See [HTTPS for the Approval Server](#https-for-the-approval-server) -- `http://` is rejected for public hosts by default |
+| `allow_insecure_http` | `false` | If true, permit `http://` in `url` even for a public host (not recommended) |
+| `tls_cert` | (empty) | PEM certificate (chain) path; serves HTTPS natively when set with `tls_key` |
+| `tls_key` | (empty) | PEM private key path matching `tls_cert` |
 | `log_file` | `/var/log/pam-ssh-2fa-server.log` | Approval server log file |
 
 The `url` must be reachable from the user's phone. Examples:
 ```ini
 [server]
 port = 9110
-url = http://203.0.113.50:9110           # Public IP
-url = http://myserver.example.com:9110   # Public hostname
-url = http://myserver.tailnet.ts.net:9110  # Tailscale
+url = https://203.0.113.50:9110              # Public IP, needs HTTPS
+url = https://myserver.example.com:9110      # Public hostname, needs HTTPS
+url = http://100.101.102.103:9110            # Raw Tailscale IP, http:// OK
+url = https://myserver.tailnet.ts.net:9110   # Tailscale hostname, needs HTTPS
 ```
 
 ## Per-User Configuration
@@ -551,8 +583,13 @@ sudo pamtester sshd yourusername authenticate
 - Check approval server is running: `systemctl status pam-ssh-2fa-server`
 - Verify `[server] url` is set in config.ini
 - Ensure firewall allows the port: `sudo ufw allow 9110/tcp`
-- Test URL is reachable from phone: `curl http://your-server:9110/health`
+- Test URL is reachable from phone: `curl https://your-server:9110/health` (or `http://` for loopback/private/Tailscale-IP deployments)
 - Check approval server log: `tail -f /var/log/pam-ssh-2fa-server.log`
+
+**"server_url uses http:// for a public host" error:**
+- `[server] url` uses `http://` for a host that isn't loopback, private, or a raw Tailscale IP -- see [HTTPS for the Approval Server](#https-for-the-approval-server)
+- Switch `url` to `https://`, either via `tls_cert`/`tls_key` or a reverse proxy
+- Or, only if you understand the risk, set `[server] allow_insecure_http = true`
 
 **"2FA not configured for this user" error:**
 - User has no per-user config AND no global apprise_urls
@@ -589,8 +626,9 @@ systemctl status pam-ssh-2fa-server
 # Check health endpoint
 curl http://localhost:9110/health
 
-# Check from external (replace with your URL)
-curl http://your-server:9110/health
+# Check from external (replace with your URL; use https:// unless it's
+# a loopback/private/Tailscale-IP deployment)
+curl https://your-server:9110/health
 ```
 
 ## Security Considerations
@@ -601,10 +639,10 @@ curl http://your-server:9110/health
 4. **Monitor logs** for failed authentication attempts
 5. **Test thoroughly** before deploying to production
 6. **Have a recovery plan** - Console access, bypass user, etc.
-7. **Approval server exposure** - The approval server must be internet-accessible for link auth. Consider:
+7. **Approval server exposure** - The approval server must be reachable for link auth. Consider:
    - Use a firewall to limit source IPs if possible
    - Tokens are cryptographically random and single-use
-   - Consider reverse proxy with HTTPS for additional security
+   - HTTPS is required by default for any host that isn't loopback/private/Tailscale -- see [HTTPS for the Approval Server](#https-for-the-approval-server) for native TLS vs. reverse-proxy options
 8. **Per-user configs** - Store API keys in per-user configs with 0600 permissions
 9. **Avoid `allow_unconfigured_users = true`** in production - it bypasses 2FA for unknown users
 

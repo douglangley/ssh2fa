@@ -99,7 +99,7 @@ pam-ssh-2fa/
 | `[general]` | Debug mode, log file path |
 | `[codes]` | Code length, timeout, max attempts, storage |
 | `[notifications]` | Apprise URLs, message templates |
-| `[server]` | Approval server port and URL |
+| `[server]` | Approval server port, URL, TLS |
 | `[messages]` | User-facing prompts and messages |
 | `[bypass]` | Users and networks to skip 2FA |
 | `[ratelimit]` | Per-user/per-source/concurrency request limits |
@@ -128,6 +128,10 @@ body_both = Click: {link} Or code: {code}     # Combined template
 [server]
 port = 9110                             # Approval server port
 url =                                   # Public URL (REQUIRED for link auth)
+                                         # http:// rejected for public hosts by default
+allow_insecure_http = false             # Override the http:// rejection above
+tls_cert =                              # PEM cert; native HTTPS if set with tls_key
+tls_key =                               # PEM key matching tls_cert
 log_file = /var/log/pam-ssh-2fa-server.log
 
 [messages]
@@ -193,7 +197,9 @@ method = link    # code, link, both, none
 1. User connects via SSH with key
 2. `pam_sm_authenticate()` called
 3. `RateLimiter` checks per-user/per-source/concurrency limits
-4. `ApprovalManager.create_approval()` generates token, saves request file
+4. `ApprovalManager.create_approval()` rejects an insecure `http://` URL
+   to a public host (see `_check_server_url_security()`), then
+   generates a token and saves the request file
 5. `NotificationSender.send()` pushes link via Apprise
 6. User shown "Waiting for approval..."
 7. PAM polls `ApprovalManager.is_approved()` every second
@@ -244,9 +250,9 @@ method = link    # code, link, both, none
 
 ### Adding a New Config Option
 
-1. Add default value to `DEFAULTS` dict in pam_ssh_2fa.py (~line 118)
-2. Add to `section_mapping` in `Config._parse_config_file()` (~line 435)
-3. If per-user configurable, add to the `user_only` mapping (~line 483)
+1. Add default value to `DEFAULTS` dict in pam_ssh_2fa.py (~line 120)
+2. Add to `section_mapping` in `Config._parse_config_file()` (~line 438)
+3. If per-user configurable, add to the `user_only` mapping (~line 489)
 4. If numeric and security-relevant, validate with `_bounded_int(min, max)`
    as the converter instead of the bare `int`/`str` type (see `code_length`
    or the `ratelimit_*` settings for examples)
@@ -256,21 +262,21 @@ method = link    # code, link, both, none
 
 ### Adding a New Notification Template Variable
 
-1. Add to `template_vars` dict in `NotificationSender.send()` (~line 1360)
+1. Add to `template_vars` dict in `NotificationSender.send()` (~line 1459)
 2. Document in config.ini comments
 3. Update README.md template variables list
 
 ### Adding a New Auth Method
 
-1. Add to validation in `pam_sm_authenticate()` (~line 1949)
-2. Add handling logic in the Step 7 section (~line 2115)
+1. Add to validation in `pam_sm_authenticate()` (~line 2048)
+2. Add handling logic in the Step 7 section (~line 2215)
 3. Update config.ini comments
 4. Update README.md Authentication Methods section
 5. Update per-user example configs
 
 ### Adding a New Bypass Condition
 
-1. Add check method to `BypassChecker` class (~line 1479)
+1. Add check method to `BypassChecker` class (~line 1578)
 2. Call from `should_bypass()` method
 3. Add config option following "Adding a New Config Option"
 
@@ -294,6 +300,22 @@ method = link    # code, link, both, none
 4. Update config.ini `length = X`
 5. Update all documentation references (README, config comments)
 6. Update test code examples (test_notify.py, docstrings)
+
+### Changing Approval Server URL/TLS Rules
+
+The HTTPS requirement is split across two files -- keep both in sync:
+
+1. `ApprovalManager._check_server_url_security()` and
+   `_is_non_global_host()` in pam_ssh_2fa.py decide whether a
+   `server_url` is allowed to build a link at all (this is the
+   enforcement point -- it runs in the privileged PAM auth path)
+2. `ApprovalServer.__init__()` in approval_server.py wraps the listener
+   socket in TLS when `tls_cert`/`tls_key` are both set (this is where
+   the server actually terminates HTTPS, if not using a reverse proxy)
+3. Both read `[server]` settings independently (`pam_ssh_2fa.Config`
+   and `approval_server.ServerConfig` are separate parsers) -- a new
+   `[server]` option needs a mapping entry added to both if both
+   processes need to see it
 
 ## Testing
 

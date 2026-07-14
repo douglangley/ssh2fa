@@ -102,6 +102,15 @@ class ApprovalServerSecurityTests(unittest.TestCase):
             self.request("/approve/../../etc/passwd")
         self.assertEqual(error.exception.code, 404)
 
+    def test_health_endpoint_returns_valid_json(self):
+        status, body, headers = self.request("/health")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "application/json")
+        payload = json.loads(body)
+        self.assertEqual(payload["status"], "ok")
+        self.assertIn("timestamp", payload)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -87,9 +87,11 @@ import json
 import hashlib
 import tempfile
 import fcntl
+import ipaddress
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, Tuple, Dict, Any
+from urllib.parse import urlparse
 
 # Apprise is imported conditionally to provide better error messages
 # if it's not installed
@@ -139,6 +141,7 @@ DEFAULTS = {
     "auth_method": "code",  # Default auth method: code, link, both, none
     "server_port": 9110,  # Approval server port
     "server_url": "",  # Approval server URL (e.g., http://myserver.com:9110)
+    "allow_insecure_http": False,  # Permit http:// server_url for public hosts (not recommended)
     "ratelimit_window": 300,  # Sliding window (seconds) for the two limits below
     "ratelimit_max_per_user": 5,  # Max new requests per user within the window
     "ratelimit_max_per_rhost": 15,  # Max new requests per source address within the window
@@ -462,6 +465,10 @@ class Config:
             ("users", "auth_method"): ("auth_method", str),
             ("server", "port"): ("server_port", int),
             ("server", "url"): ("server_url", str),
+            ("server", "allow_insecure_http"): (
+                "allow_insecure_http",
+                self._parse_bool,
+            ),
             ("ratelimit", "window"): ("ratelimit_window", _bounded_int(10, 86400)),
             ("ratelimit", "max_per_user"): (
                 "ratelimit_max_per_user",
@@ -997,6 +1004,7 @@ class ApprovalManager:
         timeout: int = 300,
         server_url: str = "",
         logger: Optional[PAMLogger] = None,
+        allow_insecure_http: bool = False,
     ):
         """
         Initialize the approval manager.
@@ -1006,11 +1014,17 @@ class ApprovalManager:
             timeout: Seconds until approvals expire
             server_url: Base URL for approval server (e.g., http://myserver:9110)
             logger: Optional logger for debug output
+            allow_insecure_http: If True, permit a plain http:// server_url
+                even for a public (non-loopback, non-private) host. Off by
+                default -- approval links are bearer credentials, so an
+                http:// link to a public host can be approved by anyone who
+                observes it in transit.
         """
         self.approvals_dir = approvals_dir
         self.timeout = timeout
         self.server_url = server_url.rstrip("/") if server_url else ""
         self.logger = logger
+        self.allow_insecure_http = allow_insecure_http
 
         # Ensure approvals directory exists
         self._ensure_dir()
@@ -1039,6 +1053,87 @@ class ApprovalManager:
             raise ValueError("invalid approval token")
         return os.path.join(self.approvals_dir, f"{token}.json")
 
+    @staticmethod
+    def _is_non_global_host(host: str) -> bool:
+        """
+        Decide whether a URL host is confined to a trusted network.
+
+        Only literal IP addresses can be classified this way without a
+        DNS lookup (which this module never performs at config-parse
+        time -- adding a network call to a privileged auth path is
+        exactly the kind of risk this project is trying to remove, see
+        MODERNIZATION_PLAN.md). A bare hostname is therefore treated as
+        public/untrusted even if an admin's private DNS happens to
+        resolve it internally -- "localhost" is special-cased since
+        it's a universal loopback convention rather than a real DNS
+        name.
+
+        is_global is used rather than is_private so this also covers
+        Tailscale/CGNAT addresses (100.64.0.0/10, RFC 6598 "Shared
+        Address Space"), which Python's ipaddress module does not
+        consider is_private but which are not publicly routable either.
+
+        Args:
+            host: The hostname or IP literal from a parsed URL
+
+        Returns:
+            True if the host is not routable on the public internet
+        """
+        if not host:
+            return False
+        if host == "localhost":
+            return True
+        try:
+            addr = ipaddress.ip_address(host)
+        except ValueError:
+            return False  # A real hostname -- can't vouch for it
+        return not addr.is_global
+
+    def _check_server_url_security(self):
+        """
+        Reject an insecure server_url before it's embedded in a link.
+
+        An approval link is a bearer credential: whoever observes it in
+        transit can approve the associated SSH login. A plain http://
+        link to a public host is therefore rejected unless the operator
+        explicitly opts out via allow_insecure_http. Loopback and
+        private-network deployments are exempt, since the link never
+        leaves a trusted network in that case.
+
+        Raises:
+            ValueError: If the URL's scheme is unsupported, or if it is
+                an insecure http:// URL to a public host and
+                allow_insecure_http is not set
+        """
+        parsed = urlparse(self.server_url)
+
+        if parsed.scheme == "https":
+            return
+
+        if parsed.scheme != "http":
+            raise ValueError(
+                f"server_url must use http:// or https:// (got {parsed.scheme!r})"
+            )
+
+        if self._is_non_global_host(parsed.hostname or ""):
+            return
+
+        if self.allow_insecure_http:
+            if self.logger:
+                self.logger.warning(
+                    "Sending approval link over plain HTTP to a public host",
+                    host=parsed.hostname,
+                )
+            return
+
+        raise ValueError(
+            "server_url uses http:// for a public host "
+            f"({parsed.hostname!r}); set [server] url to an https:// "
+            "address, deploy behind a TLS reverse proxy, or set "
+            "[server] allow_insecure_http = true to override "
+            "(not recommended -- see MODERNIZATION_PLAN.md)"
+        )
+
     def create_approval(self, user: str, rhost: str) -> Tuple[str, str]:
         """
         Create a new approval request.
@@ -1052,10 +1147,14 @@ class ApprovalManager:
 
         Raises:
             OSError: If unable to write the approval file
-            ValueError: If server_url is not configured
+            ValueError: If server_url is not configured, or is an
+                insecure http:// URL to a public host (see
+                _check_server_url_security)
         """
         if not self.server_url:
             raise ValueError("server_url not configured - cannot create approval links")
+
+        self._check_server_url_security()
 
         # Generate cryptographically secure random token
         token = secrets.token_urlsafe(32)
@@ -2069,6 +2168,7 @@ def pam_sm_authenticate(pamh, flags, argv):
             timeout=code_timeout,
             server_url=server_url,
             logger=logger,
+            allow_insecure_http=config.get("allow_insecure_http", False),
         )
 
         try:

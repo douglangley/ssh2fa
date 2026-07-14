@@ -31,10 +31,17 @@ CONFIGURATION
 -------------
 Server settings are in /etc/pam-ssh-2fa/config.ini under [server]:
     port = 9110
-    url = http://your-server.example.com:9110
+    url = https://your-server.example.com:9110
+    # Optional native TLS -- set both or neither:
+    # tls_cert = /etc/pam-ssh-2fa/tls/fullchain.pem
+    # tls_key = /etc/pam-ssh-2fa/tls/privkey.pem
 
 The 'url' is what appears in notification links. It must be reachable
 from the user's phone (public IP, hostname, or Tailscale address).
+pam_ssh_2fa.py refuses to build a link with an insecure http:// url for
+a public host (see SECURITY CONSIDERATIONS below), so this server must
+actually be reachable over HTTPS whenever it isn't confined to a
+private network.
 
 SECURITY CONSIDERATIONS
 -----------------------
@@ -42,7 +49,17 @@ SECURITY CONSIDERATIONS
 - Approvals expire after the configured timeout (default 5 minutes)
 - Server binds to 0.0.0.0 by default (all interfaces)
 - Consider firewall rules to limit access if needed
-- For production, consider adding HTTPS via reverse proxy
+- Approval links are bearer credentials: whoever observes one in
+  transit can approve the associated SSH login. For any deployment
+  reachable outside a private/loopback network, use HTTPS -- either
+  set tls_cert/tls_key above to serve it natively, or run this server
+  on loopback/an internal address behind a TLS-terminating reverse
+  proxy (nginx, Caddy, etc). Plain HTTP to a public host is rejected
+  by pam_ssh_2fa.py by default (see [server] allow_insecure_http in
+  config.ini to override, not recommended).
+- If deploying over Tailscale with a *.ts.net hostname (rather than a
+  raw tailnet IP), `tailscale cert` issues a free publicly-trusted
+  certificate for that hostname -- pair it with tls_cert/tls_key above.
 
 ENDPOINTS
 ---------
@@ -74,6 +91,7 @@ import html
 import re
 import secrets
 import tempfile
+import ssl
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional, Tuple
@@ -188,9 +206,6 @@ HTML_ERROR = """<!DOCTYPE html>
 </html>
 """
 
-HTML_HEALTH = """{"status": "ok", "timestamp": "{timestamp}"}"""
-
-
 # =============================================================================
 # LOGGING SETUP
 # =============================================================================
@@ -238,6 +253,10 @@ class ServerConfig:
         approvals_dir (str): Directory for approval request files
         debug (bool): Enable debug logging
         log_file (str): Path to log file
+        tls_cert (str): Path to a PEM certificate (chain) file, or ""
+            to serve plain HTTP -- see the ApprovalServer/main()
+            docstrings for when that's appropriate
+        tls_key (str): Path to the PEM private key matching tls_cert
     """
 
     def __init__(self, config_file: str = DEFAULT_CONFIG_FILE):
@@ -252,6 +271,8 @@ class ServerConfig:
         self.approvals_dir = DEFAULT_APPROVALS_DIR
         self.debug = False
         self.log_file = "/var/log/pam-ssh-2fa-server.log"
+        self.tls_cert = ""
+        self.tls_key = ""
 
         self._load_config(config_file)
 
@@ -275,6 +296,12 @@ class ServerConfig:
 
         if parser.has_option("server", "bind_address"):
             self.bind_address = parser.get("server", "bind_address")
+
+        if parser.has_option("server", "tls_cert"):
+            self.tls_cert = parser.get("server", "tls_cert")
+
+        if parser.has_option("server", "tls_key"):
+            self.tls_key = parser.get("server", "tls_key")
 
         # General settings
         if parser.has_option("general", "debug"):
@@ -601,7 +628,7 @@ class ApprovalRequestHandler(BaseHTTPRequestHandler):
     def _handle_health(self):
         """Handle health check requests."""
         timestamp = datetime.now(timezone.utc).isoformat()
-        self._send_json(200, HTML_HEALTH.format(timestamp=timestamp))
+        self._send_json(200, json.dumps({"status": "ok", "timestamp": timestamp}))
 
     def _handle_confirmation_page(self, token: str):
         """Display request details without changing approval state."""
@@ -707,12 +734,30 @@ class ApprovalRequestHandler(BaseHTTPRequestHandler):
 
 class ApprovalServer(HTTPServer):
     """
-    HTTP server for handling approval requests.
+    HTTP(S) server for handling approval requests.
 
-    Extends HTTPServer to include the ApprovalManager instance.
+    Extends HTTPServer to include the ApprovalManager instance and,
+    when a certificate and key are supplied, to serve HTTPS directly
+    instead of plain HTTP. Approval links are bearer credentials --
+    anyone who observes one in transit can approve the associated SSH
+    login -- so a production deployment reachable outside a trusted
+    private network must use one of:
+
+    - Native TLS here (tls_cert/tls_key both set)
+    - A TLS-terminating reverse proxy in front of plain HTTP
+    - A private-network-only URL (Tailscale, VPN, loopback) -- see
+      ApprovalManager._check_server_url_security() in pam_ssh_2fa.py,
+      which enforces this on the link-generation side
     """
 
-    def __init__(self, bind_address: str, port: int, approval_manager: ApprovalManager):
+    def __init__(
+        self,
+        bind_address: str,
+        port: int,
+        approval_manager: ApprovalManager,
+        tls_cert: Optional[str] = None,
+        tls_key: Optional[str] = None,
+    ):
         """
         Initialize the approval server.
 
@@ -720,9 +765,32 @@ class ApprovalServer(HTTPServer):
             bind_address: Address to bind to (e.g., "0.0.0.0")
             port: Port to listen on
             approval_manager: ApprovalManager instance for handling approvals
+            tls_cert: Path to a PEM certificate (chain) file. Must be
+                given together with tls_key, or not at all.
+            tls_key: Path to the PEM private key matching tls_cert.
+
+        Raises:
+            ValueError: If exactly one of tls_cert/tls_key is given
+            ssl.SSLError: If the certificate/key can't be loaded
+            OSError: If a given path doesn't exist or isn't readable
         """
+        if bool(tls_cert) != bool(tls_key):
+            raise ValueError(
+                "tls_cert and tls_key must both be set, or neither "
+                "(a half-configured TLS setup is refused rather than "
+                "silently falling back to plain HTTP)"
+            )
+
         super().__init__((bind_address, port), ApprovalRequestHandler)
         self.approval_manager = approval_manager
+        self.tls_enabled = False
+
+        if tls_cert and tls_key:
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.minimum_version = ssl.TLSVersion.TLSv1_2
+            context.load_cert_chain(certfile=tls_cert, keyfile=tls_key)
+            self.socket = context.wrap_socket(self.socket, server_side=True)
+            self.tls_enabled = True
 
 
 # =============================================================================
@@ -779,6 +847,9 @@ Examples:
   %(prog)s                      Run with default settings
   %(prog)s --port 9110          Run on specific port
   %(prog)s --debug              Enable debug logging
+  %(prog)s --tls-cert fullchain.pem --tls-key privkey.pem
+                                 Serve HTTPS directly instead of relying
+                                 on a reverse proxy
         """,
     )
 
@@ -799,6 +870,14 @@ Examples:
         "--debug", "-d", action="store_true", help="Enable debug logging"
     )
 
+    parser.add_argument(
+        "--tls-cert", help="Path to a PEM certificate file (overrides config file)"
+    )
+
+    parser.add_argument(
+        "--tls-key", help="Path to the PEM private key (overrides config file)"
+    )
+
     args = parser.parse_args()
 
     # Load configuration
@@ -811,6 +890,10 @@ Examples:
         config.bind_address = args.bind
     if args.debug:
         config.debug = True
+    if args.tls_cert:
+        config.tls_cert = args.tls_cert
+    if args.tls_key:
+        config.tls_key = args.tls_key
 
     # Setup logging
     setup_logging(debug=config.debug, log_file=config.log_file)
@@ -823,10 +906,28 @@ Examples:
     cleanup_thread.start()
 
     # Create and start server
-    server = ApprovalServer(config.bind_address, config.port, approval_manager)
+    try:
+        server = ApprovalServer(
+            config.bind_address,
+            config.port,
+            approval_manager,
+            tls_cert=config.tls_cert or None,
+            tls_key=config.tls_key or None,
+        )
+    except (ValueError, OSError, ssl.SSLError) as e:
+        logging.error(f"Failed to start server: {e}")
+        cleanup_thread.stop()
+        sys.exit(1)
 
     logging.info(f"PAM SSH 2FA Approval Server starting")
-    logging.info(f"Listening on {config.bind_address}:{config.port}")
+    scheme = "https" if server.tls_enabled else "http"
+    logging.info(f"Listening on {scheme}://{config.bind_address}:{config.port}")
+    if not server.tls_enabled:
+        logging.warning(
+            "Serving plain HTTP -- approval links are bearer credentials. "
+            "Use tls_cert/tls_key, a TLS-terminating reverse proxy, or "
+            "confine this deployment to a private network."
+        )
     logging.info(f"Approvals directory: {config.approvals_dir}")
 
     try:
