@@ -85,6 +85,7 @@ import configparser
 import logging
 import json
 import hashlib
+import tempfile
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Optional, Tuple, Dict, Any
@@ -141,6 +142,11 @@ PAM_USER_UNKNOWN = 10
 PAM_MAXTRIES = 11
 PAM_IGNORE = 25
 
+# Format shared by every bearer token this module hands out (OTP request IDs,
+# approval tokens). One strict format used everywhere means a token is either
+# valid or rejected outright -- never silently rewritten to fit a filename.
+TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{32,128}")
+
 
 # =============================================================================
 # LOGGING SETUP
@@ -177,7 +183,10 @@ class PAMLogger:
             debug: If True, DEBUG level messages will be logged.
         """
         self.log_file = log_file
-        self.debug = debug
+        # Named distinctly from the debug() method below -- an attribute
+        # and a method can't share a name on the same instance without one
+        # shadowing the other.
+        self.debug_enabled = debug
         self.logger = logging.getLogger("pam-ssh-2fa")
         self.logger.setLevel(logging.DEBUG if debug else logging.INFO)
 
@@ -247,7 +256,7 @@ class PAMLogger:
 
     def debug(self, message: str, **kwargs):
         """Log a DEBUG level message (only if debug mode is enabled)."""
-        if self.debug:
+        if self.debug_enabled:
             self.logger.debug(self._format_message(message, **kwargs))
 
 
@@ -516,9 +525,11 @@ class CodeManager:
     """
     Manages generation, storage, and validation of one-time codes.
 
-    Codes are stored in individual files named by a hash of the username
-    and session info. This allows multiple pending codes for different
-    sessions while preventing enumeration of usernames.
+    Codes are stored in individual files named by a random request ID
+    generated fresh for every authentication attempt -- never by the
+    username or remote address. Two simultaneous connections from the
+    same user and source (e.g. behind NAT) therefore always get distinct
+    state and cannot overwrite or steal each other's code.
 
     File format is JSON with:
     - code: The plaintext OTP code
@@ -534,6 +545,8 @@ class CodeManager:
     - Codes automatically expire
     - Codes are deleted after successful use
     - Failed attempts are tracked and limited
+    - Request IDs are single-use, unguessable bearer tokens; validate()
+      still cross-checks user/rhost as defense in depth
 
     Attributes:
         storage_dir (str): Directory for code storage files
@@ -544,8 +557,10 @@ class CodeManager:
 
     Usage:
         manager = CodeManager("/var/run/pam-ssh-2fa", logger=logger)
-        code = manager.generate("john", "192.168.1.1")
-        is_valid = manager.validate("john", "192.168.1.1", "1234")
+        code, request_id = manager.generate("john", "192.168.1.1")
+        is_valid, message = manager.validate(
+            "john", "192.168.1.1", request_id, "1234"
+        )
     """
 
     def __init__(
@@ -596,39 +611,71 @@ class CodeManager:
             except OSError:
                 pass
 
-    def _get_code_file(self, user: str, rhost: str) -> str:
+    def _get_code_file(self, request_id: str) -> str:
         """
-        Get the path to the code file for a user/session.
-
-        Uses a hash of user and rhost to prevent username enumeration
-        while still allowing session-specific codes.
+        Get the path to the code file for an authentication request.
 
         Args:
-            user: Username
-            rhost: Remote host IP address
+            request_id: Unique per-attempt request ID (see generate())
 
         Returns:
             Full path to the code file
-        """
-        # Create a hash of user+rhost for the filename
-        # This prevents enumeration of usernames from the filesystem
-        session_key = f"{user}:{rhost}"
-        file_hash = hashlib.sha256(session_key.encode()).hexdigest()[:16]
-        return os.path.join(self.storage_dir, f"code_{file_hash}.json")
 
-    def generate(self, user: str, rhost: str) -> str:
+        Raises:
+            ValueError: If request_id does not match the expected token
+                format. Malformed IDs are rejected outright rather than
+                sanitized, so two different inputs can never resolve to
+                the same file.
         """
-        Generate a new one-time code for a user session.
+        if not TOKEN_RE.fullmatch(request_id):
+            raise ValueError("invalid request id")
+        return os.path.join(self.storage_dir, f"code_{request_id}.json")
 
-        Creates a cryptographically secure random code and stores it
-        with metadata for later validation.
+    def _write_atomic(self, code_file: str, code_data: dict):
+        """
+        Replace a code file's contents in one atomic filesystem operation.
+
+        Writes to a temporary file in the same directory and renames it
+        over the target, so a concurrent reader (or a crash mid-write)
+        never observes a partially written or corrupt state file.
+
+        Args:
+            code_file: Path to the code file to replace
+            code_data: JSON-serializable state to write
+        """
+        fd, temporary_path = tempfile.mkstemp(
+            dir=self.storage_dir, prefix=".code-", text=True
+        )
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w") as f:
+                json.dump(code_data, f)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary_path, code_file)
+        except Exception:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
+            raise
+
+    def generate(self, user: str, rhost: str) -> Tuple[str, str]:
+        """
+        Generate a new one-time code for a single authentication attempt.
+
+        Creates a cryptographically secure random code and a unique
+        request ID, then stores them with metadata for later validation.
+        The request ID -- not the username or remote address -- names the
+        state file, so concurrent attempts never collide.
 
         Args:
             user: Username requesting authentication
             rhost: Remote host IP address
 
         Returns:
-            The generated code as a string (e.g., "1234")
+            Tuple of (code, request_id). The caller must hold on to
+            request_id and pass it back to validate().
 
         Raises:
             OSError: If unable to write the code file
@@ -636,6 +683,10 @@ class CodeManager:
         # Generate cryptographically secure random code
         # Using secrets module for security-sensitive randomness
         code = "".join(str(secrets.randbelow(10)) for _ in range(self.code_length))
+
+        # Unique bearer ID for this attempt only -- never reused, never
+        # derived from user/rhost.
+        request_id = secrets.token_urlsafe(32)
 
         # Calculate expiration time
         now = time.time()
@@ -652,11 +703,12 @@ class CodeManager:
         }
 
         # Write to file with secure permissions
-        code_file = self._get_code_file(user, rhost)
+        code_file = self._get_code_file(request_id)
 
-        # Create file with restricted permissions from the start
-        # Using os.open with mode flags to ensure atomic secure creation
-        fd = os.open(code_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        # Create file with restricted permissions from the start. O_EXCL
+        # guarantees we never silently overwrite another attempt's state,
+        # even in the astronomically unlikely event of a token collision.
+        fd = os.open(code_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
             with os.fdopen(fd, "w") as f:
                 json.dump(code_data, f)
@@ -675,14 +727,17 @@ class CodeManager:
                 expires_in=f"{self.timeout}s",
             )
 
-        return code
+        return code, request_id
 
-    def validate(self, user: str, rhost: str, entered_code: str) -> Tuple[bool, str]:
+    def validate(
+        self, user: str, rhost: str, request_id: str, entered_code: str
+    ) -> Tuple[bool, str]:
         """
         Validate an entered code against the stored code.
 
         Checks if:
-        - A code exists for this user/session
+        - A code exists for this request ID
+        - The stored user/rhost match this authentication attempt
         - The code hasn't expired
         - Maximum attempts haven't been exceeded
         - The entered code matches
@@ -693,6 +748,7 @@ class CodeManager:
         Args:
             user: Username
             rhost: Remote host IP address
+            request_id: The request ID returned by generate()
             entered_code: The code entered by the user
 
         Returns:
@@ -700,7 +756,10 @@ class CodeManager:
             - success: True if code was valid
             - message: Human-readable result message
         """
-        code_file = self._get_code_file(user, rhost)
+        try:
+            code_file = self._get_code_file(request_id)
+        except ValueError:
+            return False, "Invalid request. Please reconnect."
 
         # Check if code file exists
         if not os.path.exists(code_file):
@@ -720,13 +779,15 @@ class CodeManager:
             self._cleanup_code(code_file)
             return False, "Internal error. Please reconnect."
 
-        # Verify the code is for this user (defense in depth)
-        if code_data.get("user") != user:
+        # Verify the code belongs to this user and source (defense in
+        # depth -- the request ID alone already scopes the file to this
+        # one attempt, but a mismatch here means something is very wrong).
+        if code_data.get("user") != user or code_data.get("rhost") != rhost:
             if self.logger:
                 self.logger.warning(
-                    "User mismatch in code validation",
-                    expected=code_data.get("user"),
-                    got=user,
+                    "User/rhost mismatch in code validation",
+                    expected=f"{code_data.get('user')}:{code_data.get('rhost')}",
+                    got=f"{user}:{rhost}",
                 )
             return False, "Session mismatch. Please reconnect."
 
@@ -762,9 +823,8 @@ class CodeManager:
         remaining = self.max_attempts - code_data["attempts"]
 
         try:
-            with open(code_file, "w") as f:
-                json.dump(code_data, f)
-        except IOError:
+            self._write_atomic(code_file, code_data)
+        except OSError:
             pass  # Best effort to save attempts
 
         if self.logger:
@@ -915,7 +975,7 @@ class ApprovalManager:
         """Get the path to an approval file by token."""
         # Reject malformed tokens instead of changing them. Changing a bearer
         # token can make two different inputs address the same request.
-        if not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", token):
+        if not TOKEN_RE.fullmatch(token):
             raise ValueError("invalid approval token")
         return os.path.join(self.approvals_dir, f"{token}.json")
 
@@ -1642,6 +1702,7 @@ def pam_sm_authenticate(pamh, flags, argv):
     # -------------------------------------------------------------------------
     code_timeout = config.get("code_timeout", 300)
     code = None
+    code_request_id = None
     approval_token = None
     approval_link = None
 
@@ -1657,7 +1718,7 @@ def pam_sm_authenticate(pamh, flags, argv):
         )
 
         try:
-            code = code_manager.generate(user, rhost)
+            code, code_request_id = code_manager.generate(user, rhost)
         except OSError as e:
             logger.error(f"Failed to generate code: {e}")
             pam_error(pamh, "Internal error. Please contact administrator.")
@@ -1811,7 +1872,9 @@ def pam_sm_authenticate(pamh, flags, argv):
                     continue
 
             # Non-empty input - validate as code
-            valid, message = code_manager.validate(user, rhost, entered_code)
+            valid, message = code_manager.validate(
+                user, rhost, code_request_id, entered_code
+            )
 
             if valid:
                 pam_info(
@@ -1860,7 +1923,9 @@ def pam_sm_authenticate(pamh, flags, argv):
                 return PAM_AUTH_ERR
 
             # Validate the code
-            valid, message = code_manager.validate(user, rhost, entered_code)
+            valid, message = code_manager.validate(
+                user, rhost, code_request_id, entered_code
+            )
 
             if valid:
                 pam_info(
@@ -2035,19 +2100,25 @@ if __name__ == "__main__":
             max_attempts=3,
             logger=logger,
         )
-        test_code = code_manager.generate("testuser", "127.0.0.1")
+        test_code, test_request_id = code_manager.generate("testuser", "127.0.0.1")
         print(f"    Generated code: {test_code}")
 
         # Test validation with correct code
-        valid, msg = code_manager.validate("testuser", "127.0.0.1", test_code)
+        valid, msg = code_manager.validate(
+            "testuser", "127.0.0.1", test_request_id, test_code
+        )
         if valid:
             print("    [OK] Code validation OK")
         else:
             print(f"    [FAIL] Code validation failed: {msg}")
 
         # Test validation with incorrect code
-        test_code_2 = code_manager.generate("testuser", "127.0.0.1")
-        valid, msg = code_manager.validate("testuser", "127.0.0.1", "000000")
+        test_code_2, test_request_id_2 = code_manager.generate(
+            "testuser", "127.0.0.1"
+        )
+        valid, msg = code_manager.validate(
+            "testuser", "127.0.0.1", test_request_id_2, "000000"
+        )
         if not valid:
             print("    [OK] Invalid code rejection OK")
         else:
