@@ -15,15 +15,17 @@ This is a PAM (Pluggable Authentication Module) for SSH two-factor authenticatio
 
 ```
 pam-ssh-2fa/
-|-- pam_ssh_2fa.py          # Main PAM module (2081 lines)
-|-- approval_server.py      # HTTP server for link-based auth (696 lines)
-|-- config.ini              # Global configuration (338 lines)
-|-- install.sh              # Installation script (599 lines)
-|-- test_notify.py          # Notification testing utility (319 lines)
-|-- cleanup_codes.py        # Expired code cleanup utility (204 lines)
+|-- pam_ssh_2fa.py          # Main PAM module (~2600 lines)
+|-- approval_server.py      # HTTP server for link-based auth (~950 lines)
+|-- config.ini              # Global configuration (~400 lines)
+|-- install.sh              # Installation script (~980 lines)
+|-- test_notify.py          # Notification testing utility (~320 lines)
+|-- cleanup_codes.py        # Expired code cleanup utility (~210 lines)
 |-- pam-ssh-2fa-server.service  # Systemd service for approval server
-|-- README.md               # User documentation (672 lines)
+|-- README.md               # User documentation (~740 lines)
 |-- CLAUDE.md               # This file
+|-- MODERNIZATION_PLAN.md   # Security audit and roadmap
+|-- test_*.py               # Automated test suite (unittest)
 +-- examples/
     |-- pam.d-sshd.example      # PAM configuration examples
     |-- sshd_config.example     # SSH daemon configuration examples
@@ -87,6 +89,38 @@ pam-ssh-2fa/
 | `/approve/<token>` | POST | Approve after explicit confirmation |
 | `/health` | GET | Health check (returns JSON) |
 | `/` | GET | Info page |
+
+### install.sh - Installation Script
+
+Bash installer. Deliberately does **not** touch `/etc/pam.d/sshd` or
+`/etc/ssh/sshd_config` -- those edits are printed as manual instructions
+(see the file's top-of-file comment for why: the correct PAM stack
+position hasn't been validated across every supported distro release
+yet).
+
+**Flags:** `--dry-run` (preview, no root needed), `--yes` (non-interactive,
+never implies deleting config), `--enable-link-approval` /
+`--no-link-approval`, `--uninstall`.
+
+**Key mechanisms:**
+- `run()` -- every mutating command goes through this so `--dry-run` is
+  a complete preview, not a partial one. New install/uninstall steps
+  must use it (or `install_tracked_file`/`create_tracked_dir`, which
+  already wrap it).
+- Installation manifest (`${INSTALL_DIR}/.install-manifest`) -- records
+  every directory/file created and every backup made before an
+  overwrite (`DIR|path`, `FILE|path`, `BACKUP|original|backup`).
+  `--uninstall` reads this to remove exactly what was installed
+  (`uninstall_from_manifest`); if no manifest exists (pre-existing
+  install), it falls back to hardcoded default paths
+  (`uninstall_legacy_fallback`).
+- `verify_installation()` returns an error *count*, not a boolean --
+  the call site branches explicitly on it (`if verify_installation;
+  then ... else ... fi`) rather than letting `set -e` handle a nonzero
+  return. Do not use `((errors++))` in this codebase: under `set -e`,
+  it returns the pre-increment value as its exit status, so the first
+  increment from 0 evaluates to a "failed" command and silently kills
+  the whole script. Use `errors=$((errors + 1))` instead.
 
 ## Configuration
 
@@ -364,12 +398,16 @@ python3 /etc/pam-ssh-2fa/pam_ssh_2fa.py
 | File | Installed Location |
 |------|-------------------|
 | pam_ssh_2fa.py | /etc/pam-ssh-2fa/pam_ssh_2fa.py |
-| approval_server.py | /etc/pam-ssh-2fa/approval_server.py |
+| approval_server.py | /etc/pam-ssh-2fa/approval_server.py (only if `--enable-link-approval`) |
+| test_notify.py | /etc/pam-ssh-2fa/test_notify.py |
+| cleanup_codes.py | /etc/pam-ssh-2fa/cleanup_codes.py |
 | config.ini | /etc/pam-ssh-2fa/config.ini |
 | Per-user configs | /etc/pam-ssh-2fa/users/*.conf |
-| Systemd service | /etc/systemd/system/pam-ssh-2fa-server.service |
+| Installation manifest | /etc/pam-ssh-2fa/.install-manifest |
+| Systemd service | /etc/systemd/system/pam-ssh-2fa-server.service (only if `--enable-link-approval`) |
 | Code storage | /var/run/pam-ssh-2fa/ |
 | Approval storage | /var/run/pam-ssh-2fa/approvals/ |
+| Rate-limit counters | /var/run/pam-ssh-2fa/ratelimit/ |
 | PAM module log | /var/log/pam-ssh-2fa.log |
 | Server log | /var/log/pam-ssh-2fa-server.log |
 

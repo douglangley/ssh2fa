@@ -139,6 +139,13 @@ cd pam-ssh-2fa
 sudo ./install.sh
 ```
 
+Useful flags (`./install.sh --help` for the full list):
+- `--dry-run` -- preview every change with no root required
+- `--yes` -- skip confirmation prompts for scripted/non-interactive installs
+- `--enable-link-approval` -- also install and enable the approval server for link-based auth (skipped by default)
+
+Every file the installer creates, and every backup it makes before overwriting something, is recorded in `/etc/pam-ssh-2fa/.install-manifest` so `--uninstall` can remove precisely what was installed.
+
 ### 2. Configure Notifications
 
 Edit `/etc/pam-ssh-2fa/config.ini` and add your notification URL:
@@ -675,11 +682,12 @@ curl https://your-server:9110/health
 sudo ./install.sh --uninstall
 ```
 
+This stops and disables the approval server (if it was installed) and removes exactly the files recorded in the installation manifest -- `--dry-run` works here too, to preview what would be removed. You'll be asked whether to also delete `config.ini` and per-user configs; `--yes` always preserves them (rerun interactively to remove).
+
 Then manually:
 1. Remove the PAM line from `/etc/pam.d/sshd`
 2. Revert `/etc/ssh/sshd_config` changes
-3. Stop approval server: `sudo systemctl disable --now pam-ssh-2fa-server`
-4. Restart SSH: `sudo systemctl restart sshd`
+3. Restart SSH: `sudo systemctl restart sshd`
 
 ## How the Code Works
 
