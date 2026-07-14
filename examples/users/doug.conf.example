@@ -38,7 +38,7 @@ apprise_urls = pover://YOUR_USER_KEY@YOUR_APP_TOKEN
 #
 # Options:
 #   code - Send a 4-digit code, user types it in
-#   link - Send an approval link, user clicks it (no typing!)
+#   link - Send an approval link, user opens it and explicitly confirms
 #   both - Send both, user can type code OR click link then press Enter
 #   none - Skip 2FA entirely for this user
 #

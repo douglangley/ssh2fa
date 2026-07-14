@@ -11,8 +11,8 @@ OVERVIEW
 When a user authenticates via SSH with auth_method=link or auth_method=both:
 1. PAM module creates an approval request file with a unique token
 2. PAM sends notification containing approval link
-3. User clicks link on their phone
-4. This server marks the approval as granted
+3. User opens the link and explicitly confirms on their phone
+4. This server marks the approval as granted after the confirmation POST
 5. PAM module detects approval and grants SSH access
 
 INSTALLATION
@@ -46,7 +46,8 @@ SECURITY CONSIDERATIONS
 
 ENDPOINTS
 ---------
-GET /approve/<token>  - Approve an authentication request
+GET /approve/<token>  - Display an authentication request
+POST /approve/<token> - Approve after explicit confirmation
 GET /health           - Health check endpoint
 
 AUTHOR
@@ -69,6 +70,10 @@ import time
 import logging
 import argparse
 import configparser
+import html
+import re
+import secrets
+import tempfile
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional, Tuple
@@ -124,6 +129,33 @@ HTML_SUCCESS = """<!DOCTYPE html>
         <p>From: {rhost}</p>
         <p>Time: {time}</p>
     </div>
+</body>
+</html>
+"""
+
+HTML_CONFIRM = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Confirm SSH Access</title>
+    <style>
+        body {{ font-family: sans-serif; max-width: 600px; margin: 50px auto; padding: 20px; }}
+        button {{ font-size: 1.1rem; padding: 0.7rem 1.2rem; }}
+    </style>
+</head>
+<body>
+    <h1>Confirm SSH Access</h1>
+    <p>Approve this SSH authentication request only if you initiated it.</p>
+    <dl>
+        <dt>User</dt><dd>{user}</dd>
+        <dt>Host</dt><dd>{host}</dd>
+        <dt>From</dt><dd>{rhost}</dd>
+    </dl>
+    <form method="post" action="/approve/{token}">
+        <input type="hidden" name="confirmation_token" value="{confirmation_token}">
+        <button type="submit">Approve SSH login</button>
+    </form>
 </body>
 </html>
 """
@@ -310,9 +342,9 @@ class ApprovalManager:
         Returns:
             Full path to the approval file
         """
-        # Sanitize token to prevent directory traversal
-        safe_token = "".join(c for c in token if c.isalnum())
-        return os.path.join(self.approvals_dir, f"{safe_token}.json")
+        if not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", token):
+            raise ValueError("invalid approval token")
+        return os.path.join(self.approvals_dir, f"{token}.json")
 
     def get_approval(self, token: str) -> Optional[dict]:
         """
@@ -324,7 +356,10 @@ class ApprovalManager:
         Returns:
             Approval data dict, or None if not found/invalid
         """
-        filepath = self.get_approval_file(token)
+        try:
+            filepath = self.get_approval_file(token)
+        except ValueError:
+            return None
 
         if not os.path.exists(filepath):
             return None
@@ -335,7 +370,9 @@ class ApprovalManager:
         except (json.JSONDecodeError, IOError):
             return None
 
-    def mark_approved(self, token: str) -> Tuple[bool, Optional[dict]]:
+    def mark_approved(
+        self, token: str, confirmation_token: str
+    ) -> Tuple[bool, Optional[dict]]:
         """
         Mark an approval request as approved.
 
@@ -353,10 +390,17 @@ class ApprovalManager:
             logging.warning(f"Approval not found: {token[:8]}...")
             return False, None
 
+        expected_confirmation = approval.get("confirmation_token", "")
+        if not expected_confirmation or not secrets.compare_digest(
+            confirmation_token, expected_confirmation
+        ):
+            logging.warning(f"Invalid confirmation token: {token[:8]}...")
+            return False, approval
+
         # Check if already approved
         if approval.get("approved"):
             logging.info(f"Approval already granted: {token[:8]}...")
-            return True, approval
+            return False, approval
 
         # Check if expired
         if time.time() > approval.get("expires", 0):
@@ -370,8 +414,24 @@ class ApprovalManager:
         # Write back
         filepath = self.get_approval_file(token)
         try:
-            with open(filepath, "w") as f:
-                json.dump(approval, f)
+            # Write a complete file and atomically replace the old state so a
+            # PAM reader never observes partially written JSON.
+            fd, temporary_path = tempfile.mkstemp(
+                dir=self.approvals_dir, prefix=".approval-", text=True
+            )
+            try:
+                os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "w") as f:
+                    json.dump(approval, f)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(temporary_path, filepath)
+            except Exception:
+                try:
+                    os.unlink(temporary_path)
+                except OSError:
+                    pass
+                raise
 
             logging.info(
                 f"Approval granted: user={approval.get('user')}, "
@@ -425,7 +485,8 @@ class ApprovalRequestHandler(BaseHTTPRequestHandler):
     HTTP request handler for approval endpoints.
 
     Endpoints:
-        GET /approve/<token>  - Approve an authentication request
+        GET /approve/<token>  - Display an authentication request
+        POST /approve/<token> - Explicitly approve the request
         GET /health           - Health check
 
     The handler accesses the ApprovalManager via server.approval_manager.
@@ -440,6 +501,10 @@ class ApprovalRequestHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
         self.end_headers()
         self.wfile.write(html.encode("utf-8"))
 
@@ -464,7 +529,7 @@ class ApprovalRequestHandler(BaseHTTPRequestHandler):
         # Approval endpoint: /approve/<token>
         if path.startswith("/approve/"):
             token = path[9:]  # Remove "/approve/" prefix
-            self._handle_approve(token)
+            self._handle_confirmation_page(token)
             return
 
         # Root path - simple info
@@ -478,6 +543,43 @@ class ApprovalRequestHandler(BaseHTTPRequestHandler):
             HTML_ERROR.format(
                 title="Not Found", message="The requested page was not found."
             ),
+        )
+
+    def do_POST(self):
+        """Approve a request only after an explicit form submission."""
+        path = urlparse(self.path).path
+        if not path.startswith("/approve/"):
+            self._send_error(404, "Not Found", "The requested page was not found.")
+            return
+
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            content_length = 0
+        if content_length <= 0 or content_length > 4096:
+            self._send_error(400, "Invalid Request", "Invalid form submission.")
+            return
+
+        try:
+            form = parse_qs(
+                self.rfile.read(content_length).decode("utf-8"),
+                strict_parsing=True,
+                max_num_fields=4,
+            )
+        except (UnicodeDecodeError, ValueError):
+            self._send_error(400, "Invalid Request", "Invalid form submission.")
+            return
+
+        values = form.get("confirmation_token", [])
+        if len(values) != 1:
+            self._send_error(400, "Invalid Request", "Missing confirmation token.")
+            return
+        self._handle_approve(path[9:], values[0])
+
+    def _send_error(self, status: int, title: str, message: str):
+        self._send_html(
+            status,
+            HTML_ERROR.format(title=html.escape(title), message=html.escape(message)),
         )
 
     def _handle_root(self):
@@ -501,7 +603,33 @@ class ApprovalRequestHandler(BaseHTTPRequestHandler):
         timestamp = datetime.now(timezone.utc).isoformat()
         self._send_json(200, HTML_HEALTH.format(timestamp=timestamp))
 
-    def _handle_approve(self, token: str):
+    def _handle_confirmation_page(self, token: str):
+        """Display request details without changing approval state."""
+        approval = self.server.approval_manager.get_approval(token)
+        if approval is None:
+            self._send_error(404, "Invalid Link", "This approval link is invalid.")
+            return
+        if time.time() > approval.get("expires", 0):
+            self._send_error(410, "Link Expired", "This approval link has expired.")
+            return
+        if approval.get("approved"):
+            self._send_error(409, "Already Approved", "This request was already approved.")
+            return
+
+        self._send_html(
+            200,
+            HTML_CONFIRM.format(
+                user=html.escape(str(approval.get("user", "unknown"))),
+                host=html.escape(str(approval.get("host", "unknown"))),
+                rhost=html.escape(str(approval.get("rhost", "unknown"))),
+                token=html.escape(token, quote=True),
+                confirmation_token=html.escape(
+                    str(approval.get("confirmation_token", "")), quote=True
+                ),
+            ),
+        )
+
+    def _handle_approve(self, token: str, confirmation_token: str):
         """
         Handle approval requests.
 
@@ -521,7 +649,7 @@ class ApprovalRequestHandler(BaseHTTPRequestHandler):
         manager = self.server.approval_manager
 
         # Attempt to mark as approved
-        success, approval = manager.mark_approved(token)
+        success, approval = manager.mark_approved(token, confirmation_token)
 
         if success and approval:
             # Format the response with approval details
@@ -529,9 +657,9 @@ class ApprovalRequestHandler(BaseHTTPRequestHandler):
             self._send_html(
                 200,
                 HTML_SUCCESS.format(
-                    user=approval.get("user", "unknown"),
-                    host=approval.get("host", "unknown"),
-                    rhost=approval.get("rhost", "unknown"),
+                    user=html.escape(str(approval.get("user", "unknown"))),
+                    host=html.escape(str(approval.get("host", "unknown"))),
+                    rhost=html.escape(str(approval.get("rhost", "unknown"))),
                     time=approved_time,
                 ),
             )
@@ -553,6 +681,14 @@ class ApprovalRequestHandler(BaseHTTPRequestHandler):
                         title="Link Expired",
                         message="This approval link has expired. Please try connecting again.",
                     ),
+                )
+            elif approval_data.get("approved"):
+                self._send_error(
+                    409, "Already Approved", "This request was already approved."
+                )
+            elif approval is not None:
+                self._send_error(
+                    403, "Confirmation Failed", "The confirmation was not accepted."
                 )
             else:
                 self._send_html(

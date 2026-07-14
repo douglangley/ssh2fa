@@ -30,8 +30,8 @@ A PAM (Pluggable Authentication Module) for SSH that sends one-time verification
 1. User connects via SSH (with SSH key authentication)
 2. PAM module creates an approval request
 3. Approval link is sent to user's phone via push notification
-4. User clicks the link on their phone
-5. Access is granted automatically (no typing required!)
+4. User opens the link and taps the approval button on their phone
+5. Access is granted without typing a code
 
 ```
 +----------+     SSH Key     +----------+     Push     +----------+
@@ -65,7 +65,7 @@ This module supports four authentication methods, configurable per-user:
 | Method | Description | User Experience |
 |--------|-------------|-----------------|
 | `code` | Send a 4-digit code | User types the code |
-| `link` | Send an approval link | User clicks link on phone (no typing!) |
+| `link` | Send an approval link | User opens the link and confirms on phone |
 | `both` | Send code AND link | User can type code OR click link then press Enter |
 | `none` | Skip 2FA | No verification required |
 
@@ -253,7 +253,7 @@ ssh user@your-server
 
 # You should see: "Approval link sent to your device. Waiting for approval..."
 # Check your phone for the notification
-# Click the link
+# Open the link and tap the approval button
 # SSH session should grant access
 ```
 
@@ -394,7 +394,7 @@ networks = 192.168.1.0/24, 10.0.0.0/8
 **auth_method** sets the default authentication method:
 
 - `code` - Send a 4-digit code, user types it in (default)
-- `link` - Send an approval link, user clicks it (no typing)
+- `link` - Send an approval link; the user opens it and explicitly confirms
 - `both` - Send both code and link, user can use either
 - `none` - Skip 2FA entirely
 
@@ -646,7 +646,8 @@ A lightweight HTTP server for link-based authentication:
 2. **ApprovalRequestHandler** - Handles HTTP requests
 3. **CleanupThread** - Removes expired approvals
 4. **Endpoints**:
-   - `GET /approve/<token>` - Mark approval as granted
+   - `GET /approve/<token>` - Display request details and confirmation form
+   - `POST /approve/<token>` - Mark approval as granted after confirmation
    - `GET /health` - Health check
 
 The code is extensively commented for easy auditing and modification.

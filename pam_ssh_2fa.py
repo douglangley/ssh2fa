@@ -80,6 +80,7 @@ import os
 import sys
 import time
 import secrets
+import re
 import configparser
 import logging
 import json
@@ -912,9 +913,11 @@ class ApprovalManager:
 
     def _get_approval_file(self, token: str) -> str:
         """Get the path to an approval file by token."""
-        # Sanitize token to prevent directory traversal
-        safe_token = "".join(c for c in token if c.isalnum() or c in '-_')
-        return os.path.join(self.approvals_dir, f"{safe_token}.json")
+        # Reject malformed tokens instead of changing them. Changing a bearer
+        # token can make two different inputs address the same request.
+        if not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", token):
+            raise ValueError("invalid approval token")
+        return os.path.join(self.approvals_dir, f"{token}.json")
 
     def create_approval(self, user: str, rhost: str) -> Tuple[str, str]:
         """
@@ -950,6 +953,9 @@ class ApprovalManager:
         # Prepare approval data
         approval_data = {
             "token": token,
+            # A link preview may safely GET the page, but approval requires an
+            # explicit POST containing this independent confirmation secret.
+            "confirmation_token": secrets.token_urlsafe(32),
             "user": user,
             "rhost": rhost,
             "host": hostname,
@@ -994,7 +1000,10 @@ class ApprovalManager:
         Returns:
             True if approved, False otherwise
         """
-        approval_file = self._get_approval_file(token)
+        try:
+            approval_file = self._get_approval_file(token)
+        except ValueError:
+            return False
 
         if not os.path.exists(approval_file):
             return False
@@ -1022,7 +1031,10 @@ class ApprovalManager:
         Returns:
             True if expired or not found, False if still valid
         """
-        approval_file = self._get_approval_file(token)
+        try:
+            approval_file = self._get_approval_file(token)
+        except ValueError:
+            return True
 
         if not os.path.exists(approval_file):
             return True
@@ -1043,7 +1055,10 @@ class ApprovalManager:
         Args:
             token: The approval token to clean up
         """
-        approval_file = self._get_approval_file(token)
+        try:
+            approval_file = self._get_approval_file(token)
+        except ValueError:
+            return
         try:
             os.unlink(approval_file)
         except OSError:

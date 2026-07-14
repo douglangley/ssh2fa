@@ -6,7 +6,7 @@ This is a PAM (Pluggable Authentication Module) for SSH two-factor authenticatio
 
 **Key Features:**
 - 4-digit OTP codes sent via push notification (80+ services via Apprise)
-- Link-based approval (click to approve, no typing)
+- Link-based approval (open a link and explicitly confirm, no code typing)
 - Per-user configuration (different services/methods per user)
 - Configurable bypass for users/networks
 
@@ -185,7 +185,7 @@ method = link    # code, link, both, none
 4. `NotificationSender.send()` pushes link via Apprise
 5. User shown "Waiting for approval..."
 6. PAM polls `ApprovalManager.is_approved()` every second
-7. User clicks link on phone
+7. User opens the link and taps the explicit approval button
 8. `approval_server.py` marks request approved
 9. PAM sees approval, returns PAM_SUCCESS
 
