@@ -6,30 +6,43 @@
 # Location: /etc/pam-ssh-2fa/users/<username>.conf
 #
 # Only certain sections are used from per-user configs:
-#   [notifications] - Notification URLs and templates
-#   [auth] - Authentication method
+#   [notification]  - Native provider selection (recommended, see below)
+#   [pushover]      - Native Pushover recipient key
+#   [ntfy]          - Native ntfy publish URL/token
+#   [notifications] - Legacy Apprise URLs and templates
+#   [auth]          - Authentication method
 #
 # All other settings come from the main /etc/pam-ssh-2fa/config.ini
 #
-# This example is for a user who prefers Pushover with link-based auth.
+# This example is for a user who prefers Pushover with link-based auth,
+# using the NATIVE Pushover provider (recommended -- see
+# AUDIT_REMEDIATION_AND_ADMIN_PLAN.md Phase 3). Native providers use only
+# the Python standard library, not the Apprise dependency.
 #
 # SETUP:
 # 1. Copy this file: sudo cp doug.conf.example /etc/pam-ssh-2fa/users/doug.conf
-# 2. Edit with your Pushover credentials
-# 3. Set permissions: sudo chmod 600 /etc/pam-ssh-2fa/users/doug.conf
+# 2. Ask an administrator to register a Pushover application once (globally,
+#    see [pushover] app_token_file in /etc/pam-ssh-2fa/config.ini) --
+#    you only need your own recipient user key below, from your
+#    Pushover dashboard at https://pushover.net (top right after login)
+# 3. Edit YOUR_USER_KEY below
+# 4. Set permissions: sudo chmod 600 /etc/pam-ssh-2fa/users/doug.conf
 #
 # =============================================================================
 
-[notifications]
+[notification]
 
-# Pushover notification URL
-# Format: pover://USER_KEY@APP_TOKEN
-#
-# Get your credentials at https://pushover.net:
-#   - User Key: Found in your Pushover dashboard (top right)
-#   - App Token: Create an application, get its API Token/Key
-#
-apprise_urls = pover://YOUR_USER_KEY@YOUR_APP_TOKEN
+# Select the native Pushover provider for this user.
+providers = pushover
+
+
+[pushover]
+
+# Your Pushover recipient user key (30 case-sensitive alphanumeric
+# characters), from your Pushover dashboard. This identifies YOU as the
+# recipient; the application token (shared by all users) is configured
+# once, globally, by an administrator.
+user_key = YOUR_30_CHARACTER_PUSHOVER_USER_KEY
 
 
 [auth]
@@ -45,3 +58,15 @@ apprise_urls = pover://YOUR_USER_KEY@YOUR_APP_TOKEN
 # Pushover supports clickable links, so "link" or "both" work great.
 #
 method = link
+
+
+# -----------------------------------------------------------------------------
+# ALTERNATIVE: legacy Apprise-based Pushover (only if not using native above)
+# -----------------------------------------------------------------------------
+# Do not set both [notification] providers and [notifications] apprise_urls
+# for the same user -- pick one. Uncomment the two lines below and remove
+# the [notification]/[pushover] sections above if you need Apprise's
+# broader provider support instead of the native Pushover provider.
+#
+# [notifications]
+# apprise_urls = pover://YOUR_USER_KEY@YOUR_APP_TOKEN

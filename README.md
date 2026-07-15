@@ -50,7 +50,7 @@ A PAM (Pluggable Authentication Module) for SSH that sends one-time verification
 
 - **Push-based codes**: No app to open, code comes to you
 - **Link-based approval**: Click a link instead of typing a code
-- **Multiple notification services**: ntfy, Pushover, Telegram, Slack, Discord, email, and 80+ more
+- **Multiple notification services**: native Pushover/ntfy providers (no extra dependency), plus Telegram, Slack, Discord, email, and 80+ more via Apprise
 - **Per-user configuration**: Each user can have different auth method and notification service
 - **Redundancy support**: Send to multiple services simultaneously
 - **Configurable timeouts**: Codes/links expire after 5 minutes by default
@@ -335,7 +335,11 @@ ssh user@your-server
 
 ## Notification Services
 
-This module uses [Apprise](https://github.com/caronc/apprise) for notifications, which supports 80+ services. Here are common examples:
+For Pushover and ntfy specifically, this module has **native providers**
+(standard-library HTTP only, no third-party dependency) -- see "Native
+Providers" below, and prefer them over Apprise for those two services.
+For anything else, it uses [Apprise](https://github.com/caronc/apprise)
+for notifications, which supports 80+ services. Here are common examples:
 
 ### Per-User Configuration
 
@@ -360,6 +364,66 @@ method = link
 See the Configuration Reference section for all per-user options.
 
 Users without a personal config file use the global settings from config.ini.
+
+### Native Providers (Recommended for Pushover/ntfy)
+
+If you only need Pushover and/or ntfy, native providers avoid the Apprise
+dependency entirely (standard-library HTTP only, no third-party package).
+Select one or more with `[notification] providers` in a per-user config
+file:
+
+```ini
+# /etc/pam-ssh-2fa/users/doug.conf -- native Pushover
+[notification]
+providers = pushover
+
+[pushover]
+user_key = DOUG_30_CHARACTER_PUSHOVER_USER_KEY
+
+[auth]
+method = link
+```
+
+```ini
+# /etc/pam-ssh-2fa/users/ben.conf -- native ntfy
+[notification]
+providers = ntfy
+
+[ntfy]
+publish_url = https://ntfy.sh/ben-ssh-codes-random-string
+
+[auth]
+method = both
+```
+
+Pushover's application token (shared by every enrolled user, not
+per-user) goes in the **global** `/etc/pam-ssh-2fa/config.ini`, in a
+root-owned, mode-0600 secret file rather than the config file itself:
+
+```ini
+[pushover]
+app_token_file = /etc/pam-ssh-2fa/secrets/pushover-app-token
+```
+
+Register a Pushover application once at https://pushover.net to get
+that token; each user then only needs their own recipient user key
+(also 30 characters, found in their own Pushover dashboard).
+
+An ntfy access token (if the topic requires authentication) also goes
+in a root-owned, mode-0600 file, referenced per-user:
+
+```ini
+[ntfy]
+publish_url = https://ntfy.example.com/ssh-alice
+access_token_file = /etc/pam-ssh-2fa/secrets/users/alice-ntfy-token
+```
+
+Leaving `[notification] providers` empty (the default) uses the legacy
+`apprise_urls` path below unchanged -- existing configurations keep
+working with no changes required. Don't set both `[notification]
+providers` and `[notifications] apprise_urls` for the same user; pick
+one style. `apprise` can also be listed alongside native providers
+(`providers = pushover,apprise`) during a gradual migration.
 
 ### ntfy (Recommended for Testing)
 
@@ -428,8 +492,43 @@ All settings are in `/etc/pam-ssh-2fa/config.ini`:
 | `body` | (template) | Body template for code-only auth |
 | `body_link` | (template) | Body template for link-only auth |
 | `body_both` | (template) | Body template for code + link auth |
+| `delivery_policy` | `any` | For native providers only: `any` (one success is enough) or `all` (every configured provider must succeed) |
+| `connect_timeout` | `3` | Seconds allowed for connection establishment (native providers). Valid range 1-30 |
+| `read_timeout` | `4` | Seconds allowed for reading the response (native providers). Valid range 1-30 |
+| `total_timeout` | `8` | Hard deadline (seconds) across all configured native providers for one notification. Valid range 1-60 |
 
 Template variables: `{code}`, `{link}`, `{user}`, `{host}`, `{rhost}`, `{timeout}`
+
+### [pushover] (native provider)
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `app_token_file` | (empty) | Path to a root-owned, mode-0600 file containing the Pushover application token (global, shared by all users) |
+
+Per-user only (in `/etc/pam-ssh-2fa/users/<username>.conf`):
+
+| Setting | Description |
+|---------|-------------|
+| `user_key` | The user's own 30-character Pushover recipient user/group key |
+
+### [ntfy] (native provider)
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `allow_insecure_http` | `false` | Permit `http://` for a public host in `ntfy_publish_url` (not recommended -- same reasoning as `[server] allow_insecure_http`) |
+
+Per-user only (in `/etc/pam-ssh-2fa/users/<username>.conf`):
+
+| Setting | Description |
+|---------|-------------|
+| `publish_url` | Full `https://host[:port]/topic` publish URL |
+| `access_token_file` | Path to a root-owned, mode-0600 file containing an ntfy bearer token (optional) |
+
+### [notification] (per-user only)
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `providers` | (empty) | Comma-separated native providers to use for this user: `pushover`, `ntfy`, or both. Empty means "use the legacy `apprise_urls` path instead" |
 
 ### [messages]
 

@@ -27,7 +27,7 @@ The safest sequence is:
 5. Package it and provide a transactional installer.
 6. Run a controlled migration and security review.
 
-## Status (re-audited 2026-07-14; Phase 0/1/2 remediation landed same day)
+## Status (re-audited 2026-07-14; Phase 0/1/2/3 remediation landed same day)
 
 > **Deep-audit correction:** the first status pass overstated completion.
 > Deterministic concurrency probes proved that one OTP can validate twice and
@@ -39,12 +39,14 @@ The safest sequence is:
 > the user-administration CLI plan.
 >
 > **Update, same day:** that plan's Phase 0 (failing regression tests),
-> Phase 1 (request-state atomicity, config, secret/logging handling), and
+> Phase 1 (request-state atomicity, config, secret/logging handling),
 > Phase 2 (installer manifest/backup-restore correctness, PAM/SSH
-> alternatives) have all now landed -- see the `[FIXED]`/`[PARTIAL]` tags
-> on individual findings in `AUDIT_REMEDIATION_AND_ADMIN_PLAN.md`. Phases
-> 3-6 (native notification providers, admin CLI, unprivileged daemon,
-> packaging) have not started.
+> alternatives), and Phase 3 (native Pushover/ntfy notification
+> providers) have all now landed -- see the `[FIXED]`/`[PARTIAL]` tags on
+> individual findings in `AUDIT_REMEDIATION_AND_ADMIN_PLAN.md`. Phases
+> 4-6 (admin CLI, unprivileged daemon, packaging) have not started; the
+> Apprise migration command envisioned for Phase 3 was deferred there
+> too, since it's admin-CLI-shaped.
 
 Phases 1 and 2 (stabilize the current Python implementation; fix the
 installer and PAM/SSH guidance) are both substantially complete -- what
@@ -344,6 +346,16 @@ The Go daemon should own:
 ### Notification provider tradeoff
 
 The existing implementation obtains more than 80 provider integrations through Apprise. A native Go implementation will not automatically preserve that coverage.
+
+**Update:** the Python-side native provider work below is done --
+`notifiers.py` (stdlib-only, no new dependency) implements the small
+notifier interface, native Pushover/ntfy, strict deadlines, response
+limits, TLS verification, and secret redaction, with Apprise retained as
+a legacy adapter behind the same interface. See
+AUDIT_REMEDIATION_AND_ADMIN_PLAN.md's Phase 3 status. This was the
+Python reference implementation; a Go daemon reimplementing the same
+provider interface is still future work (this document's own Phase 2-4,
+distinct from the audit plan's phase numbering).
 
 Updated recommendation for the stated Pushover-and-ntfy-only scope:
 

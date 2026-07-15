@@ -101,6 +101,25 @@ import ipaddress
 from typing import Optional, Tuple, Any
 from urllib.parse import urlparse
 
+# pam_python.so loads this file directly (not via a normal `import`), so
+# unlike running `python3 pam_ssh_2fa.py` -- which Python itself would
+# add to sys.path[0] -- this module's own directory is never
+# automatically searched for sibling imports. Without this, `from
+# notifiers import ...` below raises ModuleNotFoundError under the real
+# PAM entry point even though notifiers.py sits right next to this file
+# on disk (confirmed via pamtester; see
+# test_pam_stack_integration.py's setUpClass, which installs both files
+# side by side in its isolated INSTALL_DIR).
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from notifiers import (
+    AppriseNotifier,
+    Notification,
+    NtfyNotifier,
+    PushoverNotifier,
+    read_secret_file,
+)
+
 # Apprise is imported conditionally to provide better error messages
 # if it's not installed
 try:
@@ -154,7 +173,25 @@ DEFAULTS = {
     "ratelimit_max_per_user": 5,  # Max new requests per user within the window
     "ratelimit_max_per_rhost": 15,  # Max new requests per source address within the window
     "ratelimit_max_concurrent_per_user": 3,  # Max outstanding requests per user at once
+    # Native notification providers (see notifiers.py and
+    # AUDIT_REMEDIATION_AND_ADMIN_PLAN.md Phase 3). Empty
+    # notification_providers means "legacy Apprise-only", using
+    # apprise_urls above -- fully backward compatible with existing
+    # configs. A non-empty list selects native providers instead/as well.
+    "notification_providers": "",  # Comma-separated: pushover, ntfy, apprise
+    "notification_delivery_policy": "any",  # any = one success is enough; all = every provider must succeed
+    "notification_connect_timeout": 3,  # Seconds allowed for connection establishment
+    "notification_read_timeout": 4,  # Seconds allowed for reading the response
+    "notification_total_timeout": 8,  # Overall deadline across all configured providers
+    "pushover_app_token_file": "",  # Path to a file containing the Pushover application token (global secret)
+    "pushover_user_key": "",  # Recipient user/group key (per-user)
+    "ntfy_publish_url": "",  # Full https://host[:port]/topic publish URL (per-user)
+    "ntfy_access_token_file": "",  # Path to a file containing an ntfy bearer token (per-user secret)
+    "ntfy_allow_insecure_http": False,  # Permit http:// ntfy_publish_url for a public host (not recommended)
 }
+
+# Valid delivery policies for notification_delivery_policy.
+NOTIFICATION_DELIVERY_POLICIES = ("any", "all")
 
 # PAM return codes (defined here for clarity)
 PAM_SUCCESS = 0
@@ -200,6 +237,20 @@ def _bounded_int(minimum: int, maximum: int):
         return parsed
 
     return convert
+
+
+def _delivery_policy(raw_value: str) -> str:
+    """
+    Config-value converter for notification_delivery_policy.
+
+    Raises ValueError for anything other than "any"/"all", which
+    _parse_config_file() catches and treats as "keep the default" --
+    same pattern as _bounded_int.
+    """
+    value = raw_value.strip().lower()
+    if value not in NOTIFICATION_DELIVERY_POLICIES:
+        raise ValueError(f"delivery_policy must be one of {NOTIFICATION_DELIVERY_POLICIES}, got {raw_value!r}")
+    return value
 
 
 # =============================================================================
@@ -534,6 +585,27 @@ class Config:
                 "ratelimit_max_concurrent_per_user",
                 _bounded_int(1, 100),
             ),
+            ("notifications", "delivery_policy"): (
+                "notification_delivery_policy",
+                _delivery_policy,
+            ),
+            ("notifications", "connect_timeout"): (
+                "notification_connect_timeout",
+                _bounded_int(1, 30),
+            ),
+            ("notifications", "read_timeout"): (
+                "notification_read_timeout",
+                _bounded_int(1, 30),
+            ),
+            ("notifications", "total_timeout"): (
+                "notification_total_timeout",
+                _bounded_int(1, 60),
+            ),
+            ("pushover", "app_token_file"): ("pushover_app_token_file", str),
+            ("ntfy", "allow_insecure_http"): (
+                "ntfy_allow_insecure_http",
+                self._parse_bool,
+            ),
         }
 
         # User configs can only override notification settings
@@ -546,6 +618,10 @@ class Config:
                 ("notifications", "body_link"): ("notification_body_link", str),
                 ("notifications", "body_both"): ("notification_body_both", str),
                 ("auth", "method"): ("auth_method", str),
+                ("notification", "providers"): ("notification_providers", str),
+                ("pushover", "user_key"): ("pushover_user_key", str),
+                ("ntfy", "publish_url"): ("ntfy_publish_url", str),
+                ("ntfy", "access_token_file"): ("ntfy_access_token_file", str),
             }
 
         for (section, key), (setting_name, converter) in section_mapping.items():
@@ -1750,6 +1826,230 @@ class NotificationSender:
             return False
 
 
+def _build_notifier(name: str, config: "Config", user_config: "Config", logger):
+    """
+    Construct one native Notifier by name, or None if it can't be built
+    (missing/invalid configuration -- logged, not raised, so one
+    misconfigured provider in a multi-provider list doesn't crash the
+    whole authentication attempt).
+
+    Args:
+        name: "pushover", "ntfy", or "apprise"
+        config: Global Config (for shared secrets/timeouts)
+        user_config: Per-user Config (for recipient-specific settings)
+        logger: PAMLogger
+
+    Returns:
+        A Notifier instance, or None if this provider isn't usable
+    """
+    connect_timeout = config.get("notification_connect_timeout", 3)
+    read_timeout = config.get("notification_read_timeout", 4)
+
+    if name == "pushover":
+        app_token = read_secret_file(config.get("pushover_app_token_file", ""), logger)
+        user_key = user_config.get("pushover_user_key", "")
+        if not app_token or not user_key:
+            logger.error(
+                "Pushover selected but not fully configured",
+                have_app_token=bool(app_token),
+                have_user_key=bool(user_key),
+            )
+            return None
+        try:
+            return PushoverNotifier(
+                app_token=app_token,
+                user_key=user_key,
+                connect_timeout=connect_timeout,
+                read_timeout=read_timeout,
+                logger=logger,
+            )
+        except ValueError as e:
+            logger.error(f"Invalid Pushover configuration: {e}")
+            return None
+
+    if name == "ntfy":
+        publish_url = user_config.get("ntfy_publish_url", "")
+        access_token = read_secret_file(
+            user_config.get("ntfy_access_token_file", ""), logger
+        )
+        if not publish_url:
+            logger.error("ntfy selected but ntfy_publish_url not configured")
+            return None
+        try:
+            return NtfyNotifier(
+                publish_url=publish_url,
+                access_token=access_token,
+                connect_timeout=connect_timeout,
+                read_timeout=read_timeout,
+                allow_insecure_http=config.get("ntfy_allow_insecure_http", False),
+                logger=logger,
+            )
+        except ValueError as e:
+            logger.error(f"Invalid ntfy configuration: {e}")
+            return None
+
+    if name == "apprise":
+        return AppriseNotifier(
+            apprise_urls=user_config.get_list("apprise_urls"), logger=logger
+        )
+
+    logger.warning("Unknown notification provider configured", provider=name)
+    return None
+
+
+def send_notifications(
+    config: "Config",
+    user_config: "Config",
+    code: str,
+    user: str,
+    rhost: str,
+    timeout: int,
+    link: Optional[str],
+    auth_method: str,
+    logger,
+) -> bool:
+    """
+    Send the OTP/approval notification, via native provider(s) if
+    [notification] providers is configured for this user, falling back
+    to the legacy Apprise-based NotificationSender otherwise -- fully
+    backward compatible with an existing apprise_urls-only setup (see
+    AUDIT_REMEDIATION_AND_ADMIN_PLAN.md Phase 3).
+
+    When native providers are used, delivery_policy ("any"/"all")
+    decides overall success across however many are configured, and
+    notification_total_timeout bounds the whole attempt so a slow/dead
+    provider can't stall PAM authentication indefinitely.
+
+    Args:
+        config: Global Config
+        user_config: Per-user Config (notification/auth settings only)
+        code: OTP code, or "" for link-only
+        user: Username for templates
+        rhost: Remote host IP for templates
+        timeout: Code/approval timeout in seconds
+        link: Optional approval link
+        auth_method: One of "code", "link", "both"
+        logger: PAMLogger
+
+    Returns:
+        True if delivery succeeded per the configured policy
+    """
+    providers = user_config.get_list("notification_providers")
+
+    if not providers:
+        # Legacy path: unchanged behavior for every existing
+        # apprise_urls-only configuration.
+        sender = NotificationSender(
+            apprise_urls=user_config.get_list("apprise_urls"),
+            title_template=user_config.get("notification_title", "SSH Login"),
+            body_template=user_config.get("notification_body", "Your code: {code}"),
+            body_template_link=user_config.get(
+                "notification_body_link", "Click to approve: {link}"
+            ),
+            body_template_both=user_config.get(
+                "notification_body_both", "Click: {link}\n\nOr code: {code}"
+            ),
+            logger=logger,
+        )
+        return sender.send(
+            code=code, user=user, rhost=rhost, timeout=timeout, link=link,
+            auth_method=auth_method,
+        )
+
+    try:
+        hostname = os.uname().nodename
+    except (AttributeError, OSError):
+        hostname = "unknown"
+
+    template_vars = {
+        "code": code or "",
+        "user": user,
+        "host": hostname,
+        "rhost": rhost,
+        "timeout": str(timeout // 60),
+        "link": link or "",
+    }
+
+    if auth_method == "link":
+        body_template = user_config.get(
+            "notification_body_link", "Click to approve: {link}"
+        )
+    elif auth_method == "both":
+        body_template = user_config.get(
+            "notification_body_both", "Click: {link}\n\nOr code: {code}"
+        )
+    else:
+        body_template = user_config.get("notification_body", "Your code: {code}")
+    title_template = user_config.get("notification_title", "SSH Login")
+
+    try:
+        title = title_template.format(**template_vars)
+        body = body_template.format(**template_vars)
+    except (KeyError, ValueError) as e:
+        logger.error(f"Notification template error: {e}")
+        title = "SSH Login"
+        if auth_method == "link":
+            body = f"Click to approve: {link}"
+        elif auth_method == "both":
+            body = f"Click: {link}\n\nOr code: {code}"
+        else:
+            body = f"Your verification code is: {code}"
+
+    notification = Notification(
+        request_id=secrets.token_hex(8),
+        title=title,
+        body=body,
+        click_url=link,
+        expires_at=time.time() + timeout,
+    )
+
+    notifiers = []
+    for name in providers:
+        notifier = _build_notifier(name.strip().lower(), config, user_config, logger)
+        if notifier is not None:
+            notifiers.append(notifier)
+
+    if not notifiers:
+        logger.error("No valid notification providers configured", user=user)
+        return False
+
+    policy = config.get("notification_delivery_policy", "any")
+    if policy not in NOTIFICATION_DELIVERY_POLICIES:
+        policy = "any"
+
+    deadline = time.monotonic() + config.get("notification_total_timeout", 8)
+    results: list = []
+
+    for notifier in notifiers:
+        if time.monotonic() > deadline:
+            logger.warning(
+                "Notification total deadline exceeded, skipping remaining providers",
+                user=user,
+                attempted=len(results),
+                configured=len(notifiers),
+            )
+            break
+
+        result = notifier.send(notification)
+        results.append(result)
+        logger.info(
+            "Notification provider result",
+            user=user,
+            rhost=rhost,
+            provider=result.provider,
+            success=result.success,
+            detail=result.redacted_detail,
+            elapsed_ms=result.elapsed_ms,
+        )
+
+        if policy == "any" and result.success:
+            return True
+
+    if policy == "all":
+        return len(results) == len(notifiers) and all(r.success for r in results)
+    return any(r.success for r in results)
+
+
 # =============================================================================
 # BYPASS CHECKER
 # =============================================================================
@@ -2388,12 +2688,19 @@ def pam_sm_authenticate(pamh, flags, argv):
         logger.debug("Using per-user config", user=user)
 
     # -------------------------------------------------------------------------
-    # Step 3.6: Check if user has notification URLs configured
+    # Step 3.6: Check if user has notification delivery configured
     # -------------------------------------------------------------------------
-    # User needs either a per-user config with URLs or global URLs must be set
+    # A user is "configured" via either the legacy apprise_urls setting or
+    # a native [notification] providers list (see notifiers.py / Phase 3
+    # in AUDIT_REMEDIATION_AND_ADMIN_PLAN.md) -- checking apprise_urls
+    # alone incorrectly treated a native-only user (no apprise_urls at
+    # all) as unconfigured, denying or silently bypassing them depending
+    # on allow_unconfigured_users. Confirmed with a real pamtester run
+    # before this fix landed.
     user_notification_urls = user_config.get_list("apprise_urls")
+    user_notification_providers = user_config.get_list("notification_providers")
 
-    if not user_notification_urls:
+    if not user_notification_urls and not user_notification_providers:
         # No notification URLs for this user - check allow_unconfigured_users
         allow_unconfigured = config.get("allow_unconfigured_users", False)
 
@@ -2643,26 +2950,20 @@ def _run_challenge(
     # -------------------------------------------------------------------------
     # Step 6: Send notification
     # -------------------------------------------------------------------------
-    sender = NotificationSender(
-        apprise_urls=user_config.get_list("apprise_urls"),
-        title_template=user_config.get("notification_title", "SSH Login"),
-        body_template=user_config.get("notification_body", "Your code: {code}"),
-        body_template_link=user_config.get(
-            "notification_body_link", "Click to approve: {link}"
-        ),
-        body_template_both=user_config.get(
-            "notification_body_both", "Click: {link}\n\nOr code: {code}"
-        ),
-        logger=logger,
-    )
-
-    if not sender.send(
+    # send_notifications() uses native Pushover/ntfy providers if this
+    # user has [notification] providers configured, falling back to the
+    # legacy Apprise-based NotificationSender otherwise -- see
+    # AUDIT_REMEDIATION_AND_ADMIN_PLAN.md Phase 3.
+    if not send_notifications(
+        config=config,
+        user_config=user_config,
         code=code or "",
         user=user,
         rhost=rhost,
         timeout=code_timeout,
         link=approval_link,
         auth_method=auth_method,
+        logger=logger,
     ):
         logger.error("Failed to send notification", user=user, rhost=rhost)
         pam_error(pamh, "Could not send verification. Please try again.")

@@ -5,7 +5,7 @@
 This is a PAM (Pluggable Authentication Module) for SSH two-factor authentication using push notifications. Users receive a code or approval link via services like ntfy, Pushover, or Telegram.
 
 **Key Features:**
-- OTP codes (6 digits by default, configurable 6-10) sent via push notification (80+ services via Apprise)
+- OTP codes (6 digits by default, configurable 6-10) sent via push notification: native Pushover/ntfy providers (recommended, stdlib-only), or 80+ services via a legacy Apprise adapter
 - Link-based approval (open a link and explicitly confirm, no code typing)
 - Per-user configuration (different services/methods per user)
 - Configurable bypass for users/networks
@@ -15,26 +15,48 @@ This is a PAM (Pluggable Authentication Module) for SSH two-factor authenticatio
 
 ```
 pam-ssh-2fa/
-|-- pam_ssh_2fa.py          # Main PAM module (~2600 lines)
+|-- pam_ssh_2fa.py          # Main PAM module (~2900 lines)
+|-- notifiers.py            # Native Pushover/ntfy/Apprise-adapter providers (~600 lines)
 |-- approval_server.py      # HTTP server for link-based auth (~950 lines)
-|-- config.ini              # Global configuration (~400 lines)
-|-- install.sh              # Installation script (~1020 lines)
+|-- config.ini              # Global configuration (~460 lines)
+|-- install.sh              # Installation script (~1070 lines)
 |-- notify_check.py         # Notification testing utility (~320 lines)
 |-- cleanup_codes.py        # Expired code cleanup utility (~210 lines)
 |-- pam-ssh-2fa-server.service  # Systemd service for approval server
 |-- README.md               # User documentation (~790 lines)
 |-- CLAUDE.md               # This file
 |-- MODERNIZATION_PLAN.md   # Security audit and roadmap
+|-- AUDIT_REMEDIATION_AND_ADMIN_PLAN.md  # Deep re-audit, remediation phases, admin CLI design
 |-- test_*.py               # Automated test suite (unittest)
 +-- examples/
     |-- pam.d-sshd.example      # PAM configuration examples
     |-- sshd_config.example     # SSH daemon configuration examples
     +-- users/
-        |-- doug.conf.example   # Per-user config (Pushover + link)
-        +-- ben.conf.example    # Per-user config (ntfy + both)
+        |-- doug.conf.example   # Per-user config (native Pushover + link)
+        +-- ben.conf.example    # Per-user config (native ntfy + both)
 ```
 
 ## Code Architecture
+
+### notifiers.py - Native Notification Providers
+
+Provider-neutral interface (`Notifier.send(Notification) -> DeliveryResult`)
+used for native Pushover/ntfy delivery, plus a legacy Apprise adapter
+implementing the same interface. Deliberately has zero dependency on
+pam_ssh_2fa.py -- see the module docstring for why (portability to a
+future daemon). Uses only the Python standard library (`urllib`, `ssl`,
+`json`) -- no new third-party dependency.
+
+| Class | Purpose |
+|-------|---------|
+| `PushoverNotifier` | Native Pushover delivery (fixed API endpoint, key-format validation, bounded sizes) |
+| `NtfyNotifier` | Native ntfy delivery (Bearer auth header, no redirect-following, insecure-http gating) |
+| `AppriseNotifier` | Legacy adapter -- wraps Apprise behind the same `Notifier` interface for migration |
+
+`Notification` and `DeliveryResult` are the shared dataclasses; see
+"Adding a New Notification Provider" below and
+AUDIT_REMEDIATION_AND_ADMIN_PLAN.md's "Native notification design"
+section for the full interface spec.
 
 ### pam_ssh_2fa.py - Main PAM Module
 
@@ -46,9 +68,18 @@ pam-ssh-2fa/
 | `Config` | INI file parsing with per-user override support |
 | `CodeManager` | Generate, store, validate OTP codes |
 | `ApprovalManager` | Create/check link-based approval requests |
-| `NotificationSender` | Send notifications via Apprise |
+| `NotificationSender` | Legacy: sends notifications via Apprise directly (still used when a user has no `[notification] providers` configured) |
 | `BypassChecker` | Determine if 2FA should be skipped |
 | `RateLimiter` | Per-user/per-source/concurrency request limits |
+
+**Notification orchestration:** `send_notifications()` (module-level
+function, not a class) is what Step 6 of `pam_sm_authenticate()` actually
+calls. It selects native provider(s) from notifiers.py if the user has
+`[notification] providers` configured, applying `delivery_policy`
+(any/all) and `notification_total_timeout` across however many are
+listed; otherwise it falls back to constructing `NotificationSender`
+exactly as before Phase 3, so an existing `apprise_urls`-only
+configuration is unaffected.
 
 **PAM Entry Points:**
 
@@ -255,7 +286,7 @@ method = link    # code, link, both, none
 4. `Config` loads user-specific settings
 5. `RateLimiter` checks per-user/per-source/concurrency limits
 6. `CodeManager.generate()` creates a code (6 digits by default) bound to a fresh per-attempt request ID, saves to file
-7. `NotificationSender.send()` pushes code via Apprise
+7. `send_notifications()` pushes the code via native Pushover/ntfy (if `[notification] providers` is set) or the legacy Apprise path
 8. User prompted for code
 9. `CodeManager.validate()` checks code against that request ID (constant-time comparison)
 10. Return PAM_SUCCESS or PAM_AUTH_ERR
@@ -268,7 +299,7 @@ method = link    # code, link, both, none
 4. `ApprovalManager.create_approval()` rejects an insecure `http://` URL
    to a public host (see `_check_server_url_security()`), then
    generates a token and saves the request file
-5. `NotificationSender.send()` pushes link via Apprise
+5. `send_notifications()` pushes the link via native Pushover/ntfy (if `[notification] providers` is set) or the legacy Apprise path
 6. User shown "Waiting for approval..."
 7. PAM polls `ApprovalManager.is_approved()` every second
 8. User opens the link and taps the explicit approval button
@@ -423,9 +454,9 @@ approval-consumption, and cleanup-on-notification-failure tests).
 
 ### Adding a New Config Option
 
-1. Add default value to `DEFAULTS` dict in pam_ssh_2fa.py (~line 120)
-2. Add to `section_mapping` in `Config._parse_config_file()` (~line 438)
-3. If per-user configurable, add to the `user_only` mapping (~line 489)
+1. Add default value to `DEFAULTS` dict in pam_ssh_2fa.py (~line 147)
+2. Add to `section_mapping` in `Config._parse_config_file()` (~line 541)
+3. If per-user configurable, add to the `user_only` mapping (~line 614)
 4. If numeric and security-relevant, validate with `_bounded_int(min, max)`
    as the converter instead of the bare `int`/`str` type (see `code_length`
    or the `ratelimit_*` settings for examples)
@@ -435,21 +466,46 @@ approval-consumption, and cleanup-on-notification-failure tests).
 
 ### Adding a New Notification Template Variable
 
-1. Add to `template_vars` dict in `NotificationSender.send()` (~line 1459)
+Template rendering happens in two places that must both be updated --
+`send_notifications()` (~line 1964, used when native providers are
+configured) builds its own `template_vars` dict before calling
+`notification.title`/`.format()`, separately from `NotificationSender.send()`
+(~line 1756, the legacy Apprise-only path). Both dicts must stay in sync.
+
+1. Add the new key to both `template_vars` dicts
 2. Document in config.ini comments
 3. Update README.md template variables list
 
+### Adding a New Notification Provider
+
+1. Add a new `Notifier`-protocol class to notifiers.py (see
+   `PushoverNotifier`/`NtfyNotifier` for the pattern: validate
+   configuration in `__init__`, raise `ValueError` on bad input, never
+   raise from `send()` -- catch and return a failed `DeliveryResult`
+   instead)
+2. Add a branch for it in `_build_notifier()` in pam_ssh_2fa.py (~line 1877)
+3. Add any new config settings to `DEFAULTS` and `section_mapping` (see
+   "Adding a New Config Option" above) -- provider secrets should be
+   `..._file` paths (see `pushover_app_token_file`), never inline values
+4. Add provider contract tests to test_notifiers.py: success, 4xx, 5xx,
+   429, timeout, malformed/oversized response, and (if it's an HTTPS
+   provider) TLS certificate verification -- see
+   `PushoverNotifierTLSTests` for the self-signed-cert pattern
+5. Update config.ini comments, README.md, and this file
+6. Never log a token/key/URL in a `DeliveryResult.redacted_detail` --
+   see the notifiers.py module docstring
+
 ### Adding a New Auth Method
 
-1. Add to validation in `pam_sm_authenticate()` (~line 2061)
-2. Add handling logic in the Step 7 section (~line 2228)
+1. Add to validation in `pam_sm_authenticate()` (~line 2724)
+2. Add handling logic in the Step 7 section (~line 2969)
 3. Update config.ini comments
 4. Update README.md Authentication Methods section
 5. Update per-user example configs
 
 ### Adding a New Bypass Condition
 
-1. Add check method to `BypassChecker` class (~line 1578)
+1. Add check method to `BypassChecker` class (~line 2058)
 2. Call from `should_bypass()` method
 3. Add config option following "Adding a New Config Option"
 4. Do not change the bypass return code in `pam_sm_authenticate()` away
@@ -552,7 +608,17 @@ service). It requires root and `pamtester`, and skips itself cleanly
 (with a stated reason) if either is missing, or if a real install
 already exists at `/etc/pam-ssh-2fa` (so it never touches a genuine
 deployment). This is the regression suite for the PAM stack findings in
-"Validated: PAM Stack Composition" above.
+"Validated: PAM Stack Composition" above, and (via
+`test_native_provider_only_user_is_not_treated_as_unconfigured`) for the
+Step 3.6 native-provider bug found while developing Phase 3 -- see
+AUDIT_REMEDIATION_AND_ADMIN_PLAN.md.
+
+`test_notifiers.py` and `test_notification_delivery.py` cover the native
+notification providers: HTTP contract tests (success/4xx/5xx/429/
+timeout/malformed/oversized/redirect/TLS) against local stub servers for
+the former, `send_notifications()`'s delivery-policy/fallback/deadline
+logic for the latter. No network access or real Pushover/ntfy account
+needed.
 
 ### Self-Test Mode
 
@@ -566,11 +632,13 @@ python3 /etc/pam-ssh-2fa/pam_ssh_2fa.py
 | File | Installed Location |
 |------|-------------------|
 | pam_ssh_2fa.py | /etc/pam-ssh-2fa/pam_ssh_2fa.py |
+| notifiers.py | /etc/pam-ssh-2fa/notifiers.py (required -- pam_ssh_2fa.py imports it) |
 | approval_server.py | /etc/pam-ssh-2fa/approval_server.py (only if `--enable-link-approval`) |
 | notify_check.py | /etc/pam-ssh-2fa/notify_check.py |
 | cleanup_codes.py | /etc/pam-ssh-2fa/cleanup_codes.py |
 | config.ini | /etc/pam-ssh-2fa/config.ini |
 | Per-user configs | /etc/pam-ssh-2fa/users/*.conf |
+| Provider secrets | /etc/pam-ssh-2fa/secrets/ (Pushover app token), /etc/pam-ssh-2fa/secrets/users/ (per-user ntfy tokens) |
 | Installation manifest | /etc/pam-ssh-2fa/.install-manifest |
 | Systemd service | /etc/systemd/system/pam-ssh-2fa-server.service (only if `--enable-link-approval`) |
 | Code storage | /var/run/pam-ssh-2fa/ |
@@ -613,6 +681,10 @@ Bypass intentionally returns `PAM_SUCCESS`, not `PAM_IGNORE`. `PAM_IGNORE` (25, 
 | /etc/pam-ssh-2fa/ | 0750 | root:root |
 | /etc/pam-ssh-2fa/config.ini | 0600 | root:root |
 | /etc/pam-ssh-2fa/users/*.conf | 0600 | root:root |
+| /etc/pam-ssh-2fa/secrets/ | 0700 | root:root |
+| /etc/pam-ssh-2fa/secrets/pushover-app-token | 0600 | root:root |
+| /etc/pam-ssh-2fa/secrets/users/ | 0700 | root:root |
+| /etc/pam-ssh-2fa/secrets/users/*-ntfy-token | 0600 | root:root |
 | /var/run/pam-ssh-2fa/ | 0700 | root:root |
 | /var/run/pam-ssh-2fa/approvals/ | 0700 | root:root |
 

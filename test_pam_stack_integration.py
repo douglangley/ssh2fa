@@ -132,6 +132,15 @@ class PamStackIntegrationTests(unittest.TestCase):
             os.path.join(REPO_DIR, "pam_ssh_2fa.py"),
             os.path.join(INSTALL_DIR, "pam_ssh_2fa.py"),
         )
+        # pam_ssh_2fa.py imports notifiers.py at module level (Phase 3
+        # native providers) -- pam_python.so loads the module from
+        # INSTALL_DIR, so notifiers.py must be co-located there too, or
+        # every PAM invocation fails at import time ("Error in service
+        # module").
+        shutil.copy(
+            os.path.join(REPO_DIR, "notifiers.py"),
+            os.path.join(INSTALL_DIR, "notifiers.py"),
+        )
 
         with open(PAM_SERVICE_FILE, "w") as f:
             f.write(
@@ -209,6 +218,58 @@ auth_method = code
 {extra}
 """
             )
+
+    def test_native_provider_only_user_is_not_treated_as_unconfigured(self):
+        # Regression test: a user configured ONLY via [notification]
+        # providers (no apprise_urls anywhere) used to be treated as
+        # "unconfigured" and denied, because the Step 3.6 check only
+        # looked at apprise_urls. Found via a real pamtester run while
+        # developing Phase 3, not from reading the code -- see
+        # AUDIT_REMEDIATION_AND_ADMIN_PLAN.md's native notification design.
+        with open(self.config_path, "w") as f:
+            f.write(
+                f"""
+[codes]
+storage_dir = {self.storage_dir}
+
+[users]
+allow_unconfigured_users = false
+auth_method = code
+"""
+            )
+        users_dir = os.path.join(INSTALL_DIR, "users")
+        os.makedirs(users_dir, exist_ok=True)
+        user_conf = os.path.join(users_dir, f"{TEST_USER}.conf")
+        with open(user_conf, "w") as f:
+            f.write(
+                f"""
+[notification]
+providers = ntfy
+
+[ntfy]
+publish_url = http://127.0.0.1:{self.notify_server.server_port}/some-topic
+"""
+            )
+        try:
+            proc = subprocess.Popen(
+                [PAMTESTER, PAM_SERVICE_NAME, TEST_USER, "authenticate"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            try:
+                code = _wait_for_code(self.storage_dir)
+                out, _ = proc.communicate(input=code + "\n", timeout=5)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+        finally:
+            os.remove(user_conf)
+
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertIn("successfully authenticated", out)
+        self.assertNotIn("not configured", out)
 
     def test_correct_code_succeeds_on_password_locked_account(self):
         # The core regression: 2FA must work even though this account
@@ -357,6 +418,15 @@ class PamStackGroupSkipTests(unittest.TestCase):
         shutil.copy(
             os.path.join(REPO_DIR, "pam_ssh_2fa.py"),
             os.path.join(INSTALL_DIR, "pam_ssh_2fa.py"),
+        )
+        # pam_ssh_2fa.py imports notifiers.py at module level (Phase 3
+        # native providers) -- pam_python.so loads the module from
+        # INSTALL_DIR, so notifiers.py must be co-located there too, or
+        # every PAM invocation fails at import time ("Error in service
+        # module").
+        shutil.copy(
+            os.path.join(REPO_DIR, "notifiers.py"),
+            os.path.join(INSTALL_DIR, "notifiers.py"),
         )
 
         with open(GROUPSKIP_SERVICE_FILE, "w") as f:

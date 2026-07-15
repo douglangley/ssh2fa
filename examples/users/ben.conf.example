@@ -6,39 +6,59 @@
 # Location: /etc/pam-ssh-2fa/users/<username>.conf
 #
 # Only certain sections are used from per-user configs:
-#   [notifications] - Notification URLs and templates
-#   [auth] - Authentication method
+#   [notification]  - Native provider selection (recommended, see below)
+#   [pushover]      - Native Pushover recipient key
+#   [ntfy]          - Native ntfy publish URL/token
+#   [notifications] - Legacy Apprise URLs and templates
+#   [auth]          - Authentication method
 #
 # All other settings come from the main /etc/pam-ssh-2fa/config.ini
 #
-# This example is for a user who prefers ntfy with code-based auth.
+# This example is for a user who prefers ntfy with code-based auth,
+# using the NATIVE ntfy provider (recommended -- see
+# AUDIT_REMEDIATION_AND_ADMIN_PLAN.md Phase 3). Native providers use only
+# the Python standard library, not the Apprise dependency.
 #
 # SETUP:
 # 1. Copy this file: sudo cp ben.conf.example /etc/pam-ssh-2fa/users/ben.conf
-# 2. Edit with your ntfy topic name
-# 3. Set permissions: sudo chmod 600 /etc/pam-ssh-2fa/users/ben.conf
+# 2. Edit publish_url below with your ntfy topic
+# 3. If using an authenticated topic, put the bearer token in a root-owned,
+#    mode-0600 file and point access_token_file at it (recommended for
+#    production -- see the SECURITY NOTE below for why)
+# 4. Set permissions: sudo chmod 600 /etc/pam-ssh-2fa/users/ben.conf
 #
 # =============================================================================
 
-[notifications]
+[notification]
 
-# ntfy notification URL
+# Select the native ntfy provider for this user.
+providers = ntfy
+
+
+[ntfy]
+
+# Full publish URL, including the topic. Must be https:// unless this
+# is a loopback/private deployment (see [ntfy] allow_insecure_http in
+# the global config.ini).
 #
 # Public ntfy.sh (free, no account needed):
-#   ntfy://ntfy.sh/your-secret-topic-name
+#   publish_url = https://ntfy.sh/your-secret-topic-name
 #
 # Self-hosted ntfy:
-#   ntfy://your-server.com/your-topic
-#   ntfys://your-server.com/your-topic  (for HTTPS)
+#   publish_url = https://your-server.example.com/your-topic
 #
-# With authentication:
-#   ntfys://user:password@your-server.com/your-topic
-#
-# SECURITY NOTE: Anyone who knows your topic name can subscribe to it
-# on the public ntfy.sh server. Use a long random string for the topic,
-# or self-host ntfy for private notifications.
-#
-apprise_urls = ntfy://ntfy.sh/ben-ssh-codes-RANDOMSTRING123
+publish_url = https://ntfy.sh/ben-ssh-codes-RANDOMSTRING123
+
+# Optional bearer token for an authenticated topic. Point this at a
+# root-owned, mode-0600 file containing just the token -- never put a
+# token directly in this config file or in publish_url's query string.
+# access_token_file = /etc/pam-ssh-2fa/secrets/users/ben-ntfy-token
+
+# SECURITY NOTE: an unauthenticated ntfy.sh topic's name is effectively
+# a shared password -- anyone who learns it can subscribe to (read) and
+# publish (spoof) messages on it. Use a long random topic name for
+# testing, and prefer a self-hosted instance with access_token_file, or
+# a reserved/protected ntfy.sh topic, for production.
 
 
 [auth]
@@ -55,3 +75,15 @@ apprise_urls = ntfy://ntfy.sh/ben-ssh-codes-RANDOMSTRING123
 # Using "both" gives the user flexibility.
 #
 method = both
+
+
+# -----------------------------------------------------------------------------
+# ALTERNATIVE: legacy Apprise-based ntfy (only if not using native above)
+# -----------------------------------------------------------------------------
+# Do not set both [notification] providers and [notifications] apprise_urls
+# for the same user -- pick one. Uncomment the two lines below and remove
+# the [notification]/[ntfy] sections above if you need Apprise's broader
+# provider support instead of the native ntfy provider.
+#
+# [notifications]
+# apprise_urls = ntfy://ntfy.sh/ben-ssh-codes-RANDOMSTRING123

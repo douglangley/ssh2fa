@@ -4,10 +4,13 @@ Status: proposed after a full repository audit on 2026-07-14; Phase 0 and
 Phase 1 of the "Implementation sequence" below (request-state atomicity,
 configuration, and secret/logging handling) landed the same day, followed
 by Phase 2 (installer manifest/backup-restore correctness, and
-correcting/removing the unverified PAM/SSH alternatives) the same day as
-well. See the `[FIXED]`/`[PARTIAL]` tags on individual findings below for
-exactly what changed and what's still open. Phases 3-6 (native
-providers, admin CLI, unprivileged daemon, packaging) have not started.
+correcting/removing the unverified PAM/SSH alternatives) and Phase 3
+(native Pushover/ntfy notification providers) the same day as well. See
+the `[FIXED]`/`[PARTIAL]` tags on individual findings below for exactly
+what changed and what's still open. Phases 4-6 (admin CLI, unprivileged
+daemon, packaging) have not started; Phase 3's migration command
+(`config migrate-notifications`) was deferred there too, since it's
+admin-CLI-shaped.
 
 This is the implementation plan for the next work. It supersedes the
 "Phase 1 is essentially complete" conclusion in `MODERNIZATION_PLAN.md`.
@@ -569,7 +572,26 @@ Required fix:
   removal after testing.
 - Install any file referenced by `Documentation=` or use a valid hosted URL.
 
-### P1-4: provider delivery behavior is underspecified and misreported
+### P1-4: provider delivery behavior is underspecified and misreported [PARTIAL]
+
+Fixed for the new native providers (Pushover/ntfy), added in Phase 3:
+explicit `delivery_policy = any|all` (default `any`); one
+`DeliveryResult` per provider plus an aggregate result in
+`send_notifications()`; strict TLS verification (`ssl.create_default_context()`,
+never disabled); no redirect-following (a 3xx is a failure, not silently
+followed with credentials); bounded response bodies
+(`MAX_RESPONSE_BYTES`); connect/read/total timeouts; `429` responses
+handled via `retryable=True` without logging secrets; automated
+provider contract tests now exist (test_notifiers.py, 28 tests).
+
+Not fixed: everything above is native-provider-only. The legacy Apprise
+path (`NotificationSender`, still used whenever `[notification]
+providers` is unset) is unchanged -- `apobj.add(url)` return values are
+still ignored, `apprise_urls` is still comma-split ambiguously, and
+Apprise's own destinations still don't get the same structured
+per-provider result. Migrating existing Apprise-only users to native
+providers requires the `config migrate-notifications` command deferred
+to Phase 4.
 
 Current issues:
 
@@ -1151,22 +1173,67 @@ Exit criteria:
   corrected group-skip alternative) has a pamtester-driven integration
   test, but only on Debian 13 (this host), not "every advertised OS".
 
-### Phase 3: add native providers behind a stable interface
+### Phase 3: add native providers behind a stable interface [DONE except the migration command]
 
 Goal: remove the mandatory broad notification dependency.
 
-- Add provider-neutral request/result types.
-- Implement and test native Pushover and ntfy providers.
-- Add `delivery_policy`, total deadline, redaction, and response caps.
-- Retain a legacy Apprise adapter and a redacted migration command.
+- Add provider-neutral request/result types. -- DONE: `Notification`/
+  `DeliveryResult`/`Notifier` in notifiers.py, matching this document's
+  "Native notification design" spec exactly.
+- Implement and test native Pushover and ntfy providers. -- DONE:
+  `PushoverNotifier`/`NtfyNotifier`, both stdlib-only (`urllib`/`ssl`),
+  no new dependency. 28 provider contract tests in test_notifiers.py.
+- Add `delivery_policy`, total deadline, redaction, and response caps. --
+  DONE: `send_notifications()` in pam_ssh_2fa.py applies `any`/`all`
+  policy and a `notification_total_timeout` deadline across however
+  many providers are configured; `MAX_RESPONSE_BYTES` bounds every HTTP
+  response read; `DeliveryResult.redacted_detail` never contains a
+  token/key/URL (asserted in tests).
+- Retain a legacy Apprise adapter and a redacted migration command. --
+  PARTIAL: `AppriseNotifier` retains Apprise behind the same interface,
+  and it can be listed alongside native providers
+  (`providers = pushover,apprise`) during a gradual migration. The
+  `config migrate-notifications --dry-run` CLI command was **not**
+  built -- it's an administration-CLI-shaped feature and is deferred to
+  Phase 4 (`pam-ssh-2fa-admin`), where the CLI infrastructure it needs
+  (secret prompting, staged config writes, admin locking) actually
+  belongs.
 
 Exit criteria:
 
 - Provider contract tests cover all HTTP/status/timeout/redirect/rate-limit
-  paths.
-- Pushover validation and ntfy token authentication work end to end.
-- A one-provider failure behaves exactly according to `any`/`all` policy.
-- Default installation no longer needs Apprise once migration is complete.
+  paths. -- MET: success, 4xx (invalid recipient), 5xx, 429, timeout,
+  malformed/oversized response, and redirect-not-followed are all
+  covered for both providers; TLS certificate/hostname verification is
+  covered for Pushover with a self-signed-cert test.
+- Pushover validation and ntfy token authentication work end to end. --
+  MET for format validation (30-char key regex, rejected before any
+  network use) and ntfy's `Authorization: Bearer` header (confirmed
+  never appears in the URL). Live Pushover recipient validation via
+  `POST /1/users/validate.json` during enrollment was not built --
+  that's an admin-CLI "enrollment" concept (Phase 4), not a Phase 3
+  provider-interface concern.
+- A one-provider failure behaves exactly according to `any`/`all`
+  policy. -- MET, see `test_notification_delivery.py`'s
+  `NativeProviderOrchestrationTests`.
+- Default installation no longer needs Apprise once migration is
+  complete. -- NOT YET: a user must still explicitly opt into native
+  providers via `[notification] providers`; Apprise remains the
+  default when that's unset, and there is no migration tooling yet to
+  move existing configs off it. install.sh still installs Apprise
+  unconditionally (unchanged from Phase 1/2 -- removing that default is
+  gated on the migration command above).
+
+**Bug found via empirical pamtester testing, not code review:** the
+existing "is this user configured for notifications" check (Step 3.6 of
+`pam_sm_authenticate()`) looked only at `apprise_urls`. A user configured
+*only* via native `[notification] providers` (the expected common case
+for a new native-provider user) was incorrectly treated as unconfigured
+and denied (or silently bypassed, depending on
+`allow_unconfigured_users`) -- confirmed with a real end-to-end
+`pamtester` run before the fix landed, then again after. Fixed by also
+checking `notification_providers`. Regression test:
+`test_pam_stack_integration.py::PamStackIntegrationTests::test_native_provider_only_user_is_not_treated_as_unconfigured`.
 
 ### Phase 4: add the root administration CLI
 

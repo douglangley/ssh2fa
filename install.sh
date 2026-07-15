@@ -383,6 +383,18 @@ create_directories() {
         success "Created $INSTALL_DIR/users (for per-user configs)"
     fi
 
+    # Secrets directory for native notification providers (Pushover app
+    # token, ntfy access tokens) -- 0700 root-only, tighter than the
+    # 0750 config dirs above, since these files are pure credentials
+    # rather than configuration. See AUDIT_REMEDIATION_AND_ADMIN_PLAN.md
+    # Phase 3.
+    if create_tracked_dir "$INSTALL_DIR/secrets" 700; then
+        success "Created $INSTALL_DIR/secrets (for Pushover/ntfy tokens)"
+    fi
+    if create_tracked_dir "$INSTALL_DIR/secrets/users" 700; then
+        success "Created $INSTALL_DIR/secrets/users (for per-user ntfy tokens)"
+    fi
+
     # Runtime storage directory (for OTP codes)
     if create_tracked_dir "$STORAGE_DIR" 700; then
         success "Created $STORAGE_DIR"
@@ -405,6 +417,19 @@ install_module() {
         success "Installed ${MODULE_FILE}"
     else
         error "Module file not found: ${SCRIPT_DIR}/${MODULE_FILE}"
+        exit 1
+    fi
+
+    # notifiers.py: pam_ssh_2fa.py imports this at module level (native
+    # Pushover/ntfy providers). pam_python.so does not add its own
+    # directory to sys.path, so this MUST be co-located with
+    # pam_ssh_2fa.py or every PAM authentication fails at import time --
+    # confirmed with pamtester while developing Phase 3, not assumed.
+    if [[ -f "${SCRIPT_DIR}/notifiers.py" ]]; then
+        install_tracked_file "${SCRIPT_DIR}/notifiers.py" "${INSTALL_DIR}/notifiers.py" 644
+        success "Installed notifiers.py"
+    else
+        error "notifiers.py not found: ${SCRIPT_DIR}/notifiers.py"
         exit 1
     fi
 
@@ -530,6 +555,14 @@ verify_installation() {
         success "Module file installed"
     else
         error "Module file missing!"
+        errors=$((errors + 1))
+    fi
+
+    # notifiers.py must sit next to pam_ssh_2fa.py -- see install_module()
+    if [[ -f "${INSTALL_DIR}/notifiers.py" ]]; then
+        success "notifiers.py installed"
+    else
+        error "notifiers.py missing! (pam_ssh_2fa.py imports it -- every authentication will fail)"
         errors=$((errors + 1))
     fi
 
@@ -985,6 +1018,7 @@ uninstall_legacy_fallback() {
 
     info "Removing module files..."
     run rm -f "${INSTALL_DIR}/${MODULE_FILE}"
+    run rm -f "${INSTALL_DIR}/notifiers.py"
     run rm -f "${INSTALL_DIR}/approval_server.py"
     run rm -f "${INSTALL_DIR}/notify_check.py"
     run rm -f "${INSTALL_DIR}/cleanup_codes.py"
@@ -992,6 +1026,7 @@ uninstall_legacy_fallback() {
 
     local removed_paths=(
         "${INSTALL_DIR}/${MODULE_FILE}"
+        "${INSTALL_DIR}/notifiers.py"
         "${INSTALL_DIR}/approval_server.py"
         "${INSTALL_DIR}/notify_check.py"
         "${INSTALL_DIR}/cleanup_codes.py"
