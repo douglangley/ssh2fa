@@ -71,15 +71,22 @@ class _NotificationStubHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 
-def _run_pamtester(user, responses, timeout=5):
+def _run_pamtester(user, responses, timeout=5, service=PAM_SERVICE_NAME):
     """
     Drive `pamtester <service> <user> authenticate`, feeding each of
     `responses` as a line of input whenever the module reads a real
     generated code from storage isn't needed (caller already knows the
     value to send). Returns (returncode, combined_output).
+
+    service defaults to PAM_SERVICE_NAME (PamStackIntegrationTests'
+    service) for backward compatibility with existing call sites -- pass
+    it explicitly for any other PAM service file, or a nonexistent
+    service name is silently substituted (falling through to the
+    system's /etc/pam.d/other) and every assertion about *why* auth was
+    denied becomes meaningless.
     """
     proc = subprocess.run(
-        [PAMTESTER, PAM_SERVICE_NAME, user, "authenticate"],
+        [PAMTESTER, service, user, "authenticate"],
         input="\n".join(responses) + "\n",
         capture_output=True,
         text=True,
@@ -317,6 +324,156 @@ allow_unconfigured_users = false
             timeout=5,
         )
         self.assertNotEqual(proc.returncode, 0)
+
+
+GROUPSKIP_SERVICE_NAME = "pam-ssh-2fa-itest-groupskip"
+GROUPSKIP_SERVICE_FILE = f"/etc/pam.d/{GROUPSKIP_SERVICE_NAME}"
+GROUPSKIP_GROUP = "pamssh2fa_itest_require2fa"
+GROUPSKIP_EXEMPT_USER = "pamssh2fa_itest_exempt"
+GROUPSKIP_REQUIRED_USER = "pamssh2fa_itest_required"
+
+
+@unittest.skipIf(_skip_reason(), _skip_reason() or "")
+class PamStackGroupSkipTests(unittest.TestCase):
+    """
+    Exercises examples/pam.d-sshd.example's OPTION 4 (2FA only for users
+    in a specific group), the corrected 3-line form:
+
+        auth [success=1 default=ignore] pam_succeed_if.so user notingroup <group>
+        auth required pam_python.so ...
+        auth required pam_permit.so
+
+    Regression coverage for AUDIT_REMEDIATION_AND_ADMIN_PLAN.md's P0-7:
+    the original 2-line version (without the trailing pam_permit.so) was
+    found, empirically, to DENY exempt users instead of granting them
+    access -- skipping the only module capable of producing PAM_SUCCESS
+    left the stack with no success recorded. Same class of bug as the
+    PAM_IGNORE issue in CLAUDE.md's "Validated: PAM Stack Composition".
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        os.makedirs(INSTALL_DIR, exist_ok=True)
+        shutil.copy(
+            os.path.join(REPO_DIR, "pam_ssh_2fa.py"),
+            os.path.join(INSTALL_DIR, "pam_ssh_2fa.py"),
+        )
+
+        with open(GROUPSKIP_SERVICE_FILE, "w") as f:
+            f.write(
+                "# Created by test_pam_stack_integration.py -- safe to delete\n"
+                "auth [success=1 default=ignore] pam_succeed_if.so "
+                f"user notingroup {GROUPSKIP_GROUP}\n"
+                f"auth required pam_python.so {INSTALL_DIR}/pam_ssh_2fa.py\n"
+                "auth required pam_permit.so\n"
+                "account required pam_permit.so\n"
+            )
+
+        subprocess.run(["groupadd", "-f", GROUPSKIP_GROUP], check=True)
+
+        for user, in_group in ((GROUPSKIP_EXEMPT_USER, False), (GROUPSKIP_REQUIRED_USER, True)):
+            try:
+                pwd.getpwnam(user)
+            except KeyError:
+                cmd = ["useradd", "-M", "-s", "/usr/sbin/nologin"]
+                if in_group:
+                    cmd += ["-G", GROUPSKIP_GROUP]
+                cmd.append(user)
+                subprocess.run(cmd, check=True)
+            subprocess.run(["passwd", "-l", user], check=True, capture_output=True)
+
+        cls.notify_server = http.server.HTTPServer(
+            ("127.0.0.1", 0), _NotificationStubHandler
+        )
+        cls.notify_url = f"json://127.0.0.1:{cls.notify_server.server_port}/hook"
+        cls.notify_thread = threading.Thread(
+            target=cls.notify_server.serve_forever, daemon=True
+        )
+        cls.notify_thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.notify_server.shutdown()
+        cls.notify_server.server_close()
+        subprocess.run(["userdel", "-f", GROUPSKIP_EXEMPT_USER], capture_output=True)
+        subprocess.run(["userdel", "-f", GROUPSKIP_REQUIRED_USER], capture_output=True)
+        subprocess.run(["groupdel", GROUPSKIP_GROUP], capture_output=True)
+        try:
+            os.remove(GROUPSKIP_SERVICE_FILE)
+        except OSError:
+            pass
+        shutil.rmtree(INSTALL_DIR, ignore_errors=True)
+
+    def setUp(self):
+        self.storage_dir = tempfile.mkdtemp(prefix="pamssh2fa-itest-groupskip-storage-")
+        os.chmod(self.storage_dir, 0o700)
+        self.config_path = os.path.join(INSTALL_DIR, "config.ini")
+
+    def tearDown(self):
+        shutil.rmtree(self.storage_dir, ignore_errors=True)
+
+    def _write_config(self, apprise_urls):
+        with open(self.config_path, "w") as f:
+            f.write(
+                f"""
+[codes]
+storage_dir = {self.storage_dir}
+
+[notifications]
+apprise_urls = {apprise_urls}
+
+[users]
+allow_unconfigured_users = false
+auth_method = code
+"""
+            )
+
+    def test_exempt_user_is_granted_access_without_any_2fa_prompt(self):
+        # Unreachable notification URL: if this user is NOT correctly
+        # exempted, the module would try to send and fail closed. Success
+        # here means the succeed_if jump (and the trailing pam_permit.so)
+        # actually worked, not that 2FA happened to pass.
+        self._write_config(apprise_urls="json://127.0.0.1:1/unreachable")
+        returncode, out = _run_pamtester(
+            GROUPSKIP_EXEMPT_USER, [], timeout=5, service=GROUPSKIP_SERVICE_NAME
+        )
+        self.assertEqual(returncode, 0, out)
+        self.assertIn("successfully authenticated", out)
+
+    def test_required_user_with_unavailable_notification_is_denied(self):
+        self._write_config(apprise_urls="json://127.0.0.1:1/unreachable")
+        returncode, out = _run_pamtester(
+            GROUPSKIP_REQUIRED_USER, [], timeout=5, service=GROUPSKIP_SERVICE_NAME
+        )
+        self.assertNotEqual(returncode, 0)
+
+    def test_required_user_with_correct_code_succeeds(self):
+        self._write_config(apprise_urls=self.notify_url)
+        proc = subprocess.Popen(
+            [PAMTESTER, GROUPSKIP_SERVICE_NAME, GROUPSKIP_REQUIRED_USER, "authenticate"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        try:
+            code = _wait_for_code(self.storage_dir)
+            out, _ = proc.communicate(input=code + "\n", timeout=5)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+        self.assertEqual(proc.returncode, 0, out)
+        self.assertIn("successfully authenticated", out)
+
+    def test_required_user_with_wrong_code_is_denied(self):
+        self._write_config(apprise_urls=self.notify_url)
+        returncode, out = _run_pamtester(
+            GROUPSKIP_REQUIRED_USER,
+            ["000000", "000000", "000000"],
+            timeout=5,
+            service=GROUPSKIP_SERVICE_NAME,
+        )
+        self.assertNotEqual(returncode, 0)
 
 
 if __name__ == "__main__":

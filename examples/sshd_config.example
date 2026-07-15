@@ -49,18 +49,39 @@ UseDNS no
 # OPTION 1: Require SSH key + 2FA for all users (most secure)
 # AuthenticationMethods publickey,keyboard-interactive:pam
 
-# OPTION 2: Require EITHER (SSH key + 2FA) OR (password + 2FA)
-# Space between options means OR
-# AuthenticationMethods publickey,keyboard-interactive:pam keyboard-interactive:pam
+# OPTION 2: "Require EITHER (SSH key + 2FA) OR (password + 2FA)" --
+# REMOVED, not achievable this way. A previous version of this file
+# suggested:
+#   AuthenticationMethods publickey,keyboard-interactive:pam keyboard-interactive:pam
+# This is wrong, not just mislabeled: every "keyboard-interactive:pam" in
+# an AuthenticationMethods line invokes the exact same PAM service
+# (/etc/pam.d/sshd) -- OpenSSH does not support routing different
+# AuthenticationMethods alternatives to different PAM stacks. Per
+# examples/pam.d-sshd.example OPTION 1, that stack contains ONLY the 2FA
+# module (no password check), so the second alternative above actually
+# means "2FA code alone, no SSH key AND no password" -- a severe
+# authentication downgrade hiding behind a label that says the opposite.
+# There is no sshd_config construct that achieves "SSH key+2FA OR
+# password+2FA" as alternate paths against a single PAM service; if you
+# need that, it requires a second, differently-configured PAM service
+# name, which this project does not currently support. See
+# AUDIT_REMEDIATION_AND_ADMIN_PLAN.md P0-7.
 
 # OPTION 3: Different requirements for different users
 # Admins need key + 2FA, others need just key
+# Verified with `sshd -T -C user=...,addr=...,host=...,laddr=...,lport=22`
+# against a standalone copy of this Match block (AUDIT_REMEDIATION_AND_ADMIN_PLAN.md P0-7):
+# an admin* username resolves to publickey,keyboard-interactive:pam and
+# any other username resolves to publickey alone, as intended.
 # Match User admin*
 #     AuthenticationMethods publickey,keyboard-interactive:pam
 # Match User *
 #     AuthenticationMethods publickey
 
 # OPTION 4: Skip 2FA from trusted networks
+# Also verified with `sshd -T -C`: an address inside either CIDR range
+# resolves to publickey alone, and any other address resolves to
+# publickey,keyboard-interactive:pam, as intended.
 # Match Address 192.168.1.0/24,10.0.0.0/8
 #     AuthenticationMethods publickey
 # Match Address *

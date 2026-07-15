@@ -44,16 +44,30 @@
 
 set -e  # Exit on any error
 
+# Private files only, from the very first mkdir/cp/manifest write --
+# matches the 0600/0700 modes this script chmods to explicitly afterward,
+# but closes the brief window between creation and that chmod call
+# during which a permissive process umask could otherwise leave a secret
+# file group/world-readable. See P0-6 (Required fix #6) in
+# AUDIT_REMEDIATION_AND_ADMIN_PLAN.md.
+umask 077
+
 # -----------------------------------------------------------------------------
 # CONFIGURATION
 # -----------------------------------------------------------------------------
 
-# Installation paths
-INSTALL_DIR="/etc/pam-ssh-2fa"
+# Installation paths. Overridable via environment variables so a test
+# harness can point this script at a disposable temp directory instead of
+# the real system paths -- see test_install_manifest.sh. Never override
+# these when actually installing; the values below are what every other
+# file in this repo (config.ini, systemd unit, README, CLAUDE.md)
+# documents as the real paths.
+INSTALL_DIR="${PAM_SSH_2FA_INSTALL_DIR:-/etc/pam-ssh-2fa}"
 MODULE_FILE="pam_ssh_2fa.py"
 CONFIG_FILE="config.ini"
-STORAGE_DIR="/var/run/pam-ssh-2fa"
-LOG_FILE="/var/log/pam-ssh-2fa.log"
+STORAGE_DIR="${PAM_SSH_2FA_STORAGE_DIR:-/var/run/pam-ssh-2fa}"
+LOG_FILE="${PAM_SSH_2FA_LOG_FILE:-/var/log/pam-ssh-2fa.log}"
+SYSTEMD_UNIT_PATH="${PAM_SSH_2FA_SYSTEMD_UNIT_PATH:-/etc/systemd/system/pam-ssh-2fa-server.service}"
 
 # Script directory (where the source files are)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -139,6 +153,51 @@ run() {
     fi
 }
 
+# Reject a manifest-derived path that falls outside the directories this
+# script actually manages, before any mutating command touches it. A
+# manifest is root-owned (0600) so this defends against a corrupted
+# manifest -- a partial write, disk error, or a bug in a future version
+# of this script -- causing --uninstall to delete or overwrite something
+# outside its own footprint, not against a hostile manifest per se. See
+# P0-6 (Required fix #5) in AUDIT_REMEDIATION_AND_ADMIN_PLAN.md.
+# Return success if directory $1 would be empty once every path in the
+# space-separated list $2 is gone. Used so --dry-run's directory-removal
+# preview is accurate: a real uninstall run genuinely deletes files
+# before this check runs, but a dry run never actually deletes anything,
+# so a bare `ls -A` would always show those files still present and
+# --dry-run would never predict a directory removal that a real run
+# would actually perform. See P0-6 in AUDIT_REMEDIATION_AND_ADMIN_PLAN.md.
+_dir_would_be_empty_excluding() {
+    local dir="$1"
+    local excluded_str="$2"
+    # shellcheck disable=SC2206 # word-splitting is intentional here
+    local excluded=($excluded_str)
+    local entry
+    while IFS= read -r entry; do
+        [[ -z "$entry" ]] && continue
+        local full="$dir/$entry"
+        local is_excluded=false
+        local e
+        for e in "${excluded[@]}"; do
+            [[ "$e" == "$full" ]] && is_excluded=true && break
+        done
+        $is_excluded || return 1
+    done < <(ls -A "$dir" 2>/dev/null)
+    return 0
+}
+
+manifest_path_is_safe() {
+    local path="$1"
+    case "$path" in
+        "$INSTALL_DIR"/*|"$INSTALL_DIR"|"$STORAGE_DIR"/*|"$STORAGE_DIR"|"$SYSTEMD_UNIT_PATH")
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
 # -----------------------------------------------------------------------------
 # INSTALLATION MANIFEST
 #
@@ -150,6 +209,14 @@ run() {
 #   FILE|<path>              - a file we created/copied (didn't exist before)
 #   BACKUP|<original>|<backup> - we backed up <original> to <backup> before
 #                                 overwriting it
+#
+# The manifest is append-only across install/upgrade runs (never
+# truncated or rewritten in place), so a path's FULL history -- not just
+# the latest run -- is what --uninstall reads to decide, per path,
+# whether it was ever freshly created (nothing to restore) or only ever
+# replaced pre-existing content (the oldest backup for that path holds
+# the true original, from before this installer ever touched it). See
+# uninstall_from_manifest() and manifest_history_for_path() below.
 # -----------------------------------------------------------------------------
 
 manifest_init() {
@@ -177,7 +244,15 @@ backup_file() {
     local file="$1"
     if [[ -f "$file" ]]; then
         local backup="${file}${BACKUP_SUFFIX}"
-        run cp "$file" "$backup"
+        # -p preserves mode, ownership, and timestamps on the backup
+        # copy. This is the only chance to capture the true original's
+        # metadata -- if a later --uninstall restores this backup (see
+        # uninstall_from_manifest), it moves the backup file back into
+        # place rather than recreating it, so whatever metadata isn't
+        # captured here is permanently lost. A plain `cp` (previous
+        # behavior) took on the process umask/ownership instead. See
+        # P0-6 in AUDIT_REMEDIATION_AND_ADMIN_PLAN.md.
+        run cp -p "$file" "$backup"
         manifest_add "BACKUP" "$file" "$backup"
         info "Backed up $file to $backup"
     fi
@@ -358,7 +433,7 @@ install_module() {
 
         if [[ -f "${SCRIPT_DIR}/pam-ssh-2fa-server.service" ]]; then
             install_tracked_file "${SCRIPT_DIR}/pam-ssh-2fa-server.service" \
-                "/etc/systemd/system/pam-ssh-2fa-server.service" 644
+                "$SYSTEMD_UNIT_PATH" 644
             run systemctl daemon-reload
             success "Installed systemd service: pam-ssh-2fa-server.service"
             info "To enable link-based auth, run: sudo systemctl enable --now pam-ssh-2fa-server"
@@ -381,23 +456,29 @@ install_module() {
         fi
     else
         warn "Config already exists, not overwriting: ${INSTALL_DIR}/${CONFIG_FILE}"
-        # Still install the new one as example
-        run cp "${SCRIPT_DIR}/${CONFIG_FILE}" "${INSTALL_DIR}/${CONFIG_FILE}.new"
-        run chmod 600 "${INSTALL_DIR}/${CONFIG_FILE}.new"
-        manifest_add "FILE" "${INSTALL_DIR}/${CONFIG_FILE}.new"
+        # Still install the new one as example. Use install_tracked_file
+        # rather than an unconditional cp + "FILE" record: if
+        # config.ini.new itself already exists (e.g. from a previous
+        # run this admin never cleaned up), it gets backed up instead of
+        # being silently overwritten and mis-recorded as freshly
+        # created -- see P0-6 in AUDIT_REMEDIATION_AND_ADMIN_PLAN.md.
+        install_tracked_file "${SCRIPT_DIR}/${CONFIG_FILE}" "${INSTALL_DIR}/${CONFIG_FILE}.new" 600
         info "New config saved as ${INSTALL_DIR}/${CONFIG_FILE}.new for reference"
     fi
 
-    # Copy example per-user configs. These are always safe to refresh in
-    # place (they're the shipped *.example templates, not a file a user
-    # would hand-edit -- real per-user configs are named <user>.conf).
+    # Copy example per-user configs. Also routed through
+    # install_tracked_file rather than an unconditional overwrite: even
+    # though these are just shipped *.example templates (not a file a
+    # user would hand-edit), a pre-existing one should still be backed
+    # up and correctly recorded rather than being overwritten and
+    # mis-recorded as freshly created -- see P0-6 in
+    # AUDIT_REMEDIATION_AND_ADMIN_PLAN.md.
     if [[ -d "${SCRIPT_DIR}/examples/users" ]]; then
         for example_file in "${SCRIPT_DIR}/examples/users"/*.example; do
             if [[ -f "$example_file" ]]; then
-                local dest="${INSTALL_DIR}/users/$(basename "$example_file")"
-                run cp "$example_file" "$dest"
-                run chmod 600 "$dest"
-                manifest_add "FILE" "$dest"
+                local dest
+                dest="${INSTALL_DIR}/users/$(basename "$example_file")"
+                install_tracked_file "$example_file" "$dest" 600
             fi
         done
         success "Installed example per-user configs in ${INSTALL_DIR}/users/"
@@ -662,22 +743,46 @@ uninstall() {
         fi
     fi
 
-    # Stop and disable the approval server if it's running. This is a
-    # service-state change, not a file removal, so it isn't covered by
-    # the manifest and always runs regardless of whether one exists.
-    if systemctl is-active --quiet pam-ssh-2fa-server 2>/dev/null; then
-        info "Stopping approval server..."
-        run systemctl stop pam-ssh-2fa-server
-        success "Stopped approval server"
+    # Stop/disable the approval server only if we can tell THIS installer
+    # is the one that put the unit file there (recorded in the
+    # manifest), or if there's no manifest at all (a pre-manifest legacy
+    # install, where ownership can't be determined any other way -- kept
+    # as the previous unconditional behavior for that case only). See
+    # P0-6 in AUDIT_REMEDIATION_AND_ADMIN_PLAN.md: previously this always
+    # stopped/disabled the service regardless of whether this installer
+    # owned it.
+    local had_manifest=false
+    [[ -f "$MANIFEST_FILE" ]] && had_manifest=true
+
+    local manifest_owns_service=false
+    if $had_manifest && grep -qF "|${SYSTEMD_UNIT_PATH}" "$MANIFEST_FILE" 2>/dev/null; then
+        manifest_owns_service=true
     fi
 
-    if systemctl is-enabled --quiet pam-ssh-2fa-server 2>/dev/null; then
-        info "Disabling approval server..."
-        run systemctl disable pam-ssh-2fa-server
-        success "Disabled approval server"
+    if ! $had_manifest || $manifest_owns_service; then
+        if systemctl is-active --quiet pam-ssh-2fa-server 2>/dev/null; then
+            info "Stopping approval server..."
+            run systemctl stop pam-ssh-2fa-server
+            success "Stopped approval server"
+        fi
+
+        if systemctl is-enabled --quiet pam-ssh-2fa-server 2>/dev/null; then
+            info "Disabling approval server..."
+            run systemctl disable pam-ssh-2fa-server
+            success "Disabled approval server"
+        fi
     fi
 
-    if [[ -f "$MANIFEST_FILE" ]]; then
+    # Capture whether the unit file exists BEFORE removal -- checking
+    # this AFTER uninstall_from_manifest/uninstall_legacy_fallback (the
+    # previous behavior) means the file is usually already gone by the
+    # time we check, so the reload that should follow removing a
+    # systemd unit almost never actually ran. See P0-6 in
+    # AUDIT_REMEDIATION_AND_ADMIN_PLAN.md.
+    local unit_existed_before_removal=false
+    [[ -f "$SYSTEMD_UNIT_PATH" ]] && unit_existed_before_removal=true
+
+    if $had_manifest; then
         info "Using installation manifest for precise removal"
         uninstall_from_manifest
     else
@@ -686,7 +791,7 @@ uninstall() {
         uninstall_legacy_fallback
     fi
 
-    if [[ -f "/etc/systemd/system/pam-ssh-2fa-server.service" ]]; then
+    if $unit_existed_before_removal; then
         run systemctl daemon-reload
     fi
 
@@ -707,54 +812,126 @@ uninstall() {
     echo "============================================================================="
 }
 
-# Remove exactly what this installer created/backed up, per the manifest,
-# instead of guessing at hardcoded paths. Config-like files (config.ini,
-# its .new companion, and per-user configs) are still gated behind an
-# explicit confirmation, same as before -- everything else (program
-# files, the systemd unit) is removed unconditionally.
+# Restore or remove one path based on its FULL manifest history (every
+# run's FILE/BACKUP records for it, not just the latest), then clean up
+# any backup files involved:
+#   - If this path was EVER recorded as FILE (freshly created the first
+#     time this installer touched it), there is no pre-existing content
+#     to recover -- delete the current file and every backup ever made
+#     for it (those backups are just intermediate versions of OUR OWN
+#     file from a prior upgrade, not the admin's original content).
+#   - If this path has ONLY EVER been recorded via BACKUP, something
+#     already existed before the FIRST managed install. The oldest
+#     backup (first BACKUP record for this path, in manifest order) is
+#     the true pre-installer original -- restore it (mv, so its
+#     preserved mode/ownership/timestamp from backup_file's `cp -p`
+#     comes back intact) and discard every newer, stray backup.
+#   - If the oldest backup no longer exists on disk (e.g. an admin
+#     manually deleted it), there is nothing left to restore; warn and
+#     just remove the current file so at least this installer's own
+#     footprint is gone.
+# Every mutated path is checked against manifest_path_is_safe() first.
+_uninstall_restore_or_delete_path() {
+    local path="$1"
+    local has_file="$2"      # "1" if ever recorded as FILE, else ""
+    local backups_str="$3"   # space-separated backup paths, oldest first
+
+    if ! manifest_path_is_safe "$path"; then
+        warn "Refusing to touch out-of-scope manifest path: $path"
+        return
+    fi
+
+    # shellcheck disable=SC2206 # word-splitting is intentional here
+    local backups=($backups_str)
+
+    if [[ "$has_file" == "1" ]]; then
+        run rm -f "$path"
+        local b
+        for b in "${backups[@]}"; do
+            [[ -n "$b" ]] && run rm -f "$b"
+        done
+        return
+    fi
+
+    if [[ ${#backups[@]} -eq 0 ]]; then
+        # Shouldn't happen (a path only ever reaches here via a BACKUP
+        # record), but fail safe rather than silently doing nothing.
+        return
+    fi
+
+    local oldest="${backups[0]}"
+    if [[ -f "$oldest" ]]; then
+        run mv -f "$oldest" "$path"
+        success "Restored original: $path"
+    else
+        warn "Original backup for $path is missing -- cannot restore it; removing our copy"
+        run rm -f "$path"
+    fi
+
+    local i
+    for ((i = 1; i < ${#backups[@]}; i++)); do
+        [[ -n "${backups[$i]}" ]] && run rm -f "${backups[$i]}"
+    done
+}
+
+# Remove or restore exactly what this installer's manifest history says
+# it touched, instead of guessing at hardcoded paths or (the previous,
+# incorrect behavior) always deleting backups instead of restoring them.
+# Config-like files (config.ini, its .new companion, and per-user
+# configs) are still gated behind an explicit confirmation, same as
+# before -- everything else (program files, the systemd unit) is
+# processed unconditionally.
 uninstall_from_manifest() {
-    local manifest_files=()
+    local all_paths=()
     local manifest_dirs=()
-    local manifest_backups=()
+    local -A path_has_file=()
+    local -A path_backups=()
 
     local type a b
     while IFS='|' read -r type a b; do
         [[ -z "$type" || "$type" == \#* ]] && continue
         case "$type" in
-            FILE) manifest_files+=("$a") ;;
-            DIR) manifest_dirs+=("$a") ;;
-            BACKUP) manifest_backups+=("$b") ;;  # only need the backup path here
+            FILE)
+                if [[ -z "${path_has_file[$a]+x}" && -z "${path_backups[$a]+x}" ]]; then
+                    all_paths+=("$a")
+                fi
+                path_has_file[$a]=1
+                ;;
+            DIR)
+                manifest_dirs+=("$a")
+                ;;
+            BACKUP)
+                if [[ -z "${path_has_file[$a]+x}" && -z "${path_backups[$a]+x}" ]]; then
+                    all_paths+=("$a")
+                fi
+                path_backups[$a]="${path_backups[$a]:-} $b"
+                ;;
         esac
     done < "$MANIFEST_FILE"
 
     local config_like=()
-    local code_files=()
+    local code_like=()
     local f
-    for f in "${manifest_files[@]}"; do
+    for f in "${all_paths[@]}"; do
         case "$f" in
             "${INSTALL_DIR}/${CONFIG_FILE}"|"${INSTALL_DIR}/${CONFIG_FILE}.new"|"${INSTALL_DIR}/users/"*)
                 config_like+=("$f") ;;
             *)
-                code_files+=("$f") ;;
+                code_like+=("$f") ;;
         esac
     done
 
-    for f in "${code_files[@]}"; do
-        run rm -f "$f"
+    for f in "${code_like[@]}"; do
+        _uninstall_restore_or_delete_path \
+            "$f" "${path_has_file[$f]:-}" "${path_backups[$f]:-}"
     done
-    success "Removed installed program files"
+    success "Removed/restored installed program files"
 
-    # Stray backups made by re-installs/upgrades of program files -- the
-    # current file is being deleted anyway, so its old backup goes too.
-    local backup
-    for backup in "${manifest_backups[@]}"; do
-        run rm -f "$backup"
-    done
-
+    local config_confirmed=false
     if [[ ${#config_like[@]} -gt 0 ]]; then
         local reply="n"
         if $ASSUME_YES; then
-            reply="n"  # --yes never implies deleting user config/secrets
+            reply="n"  # --yes never implies deleting/restoring config/secrets
             info "Preserving config files under --yes (rerun interactively to remove them)"
         else
             read -p "Remove config file and per-user configs too? [y/N] " -n 1 -r
@@ -762,11 +939,12 @@ uninstall_from_manifest() {
             reply="$REPLY"
         fi
         if [[ "$reply" =~ ^[Yy]$ ]]; then
+            config_confirmed=true
             for f in "${config_like[@]}"; do
-                run rm -f "$f"
+                _uninstall_restore_or_delete_path \
+                    "$f" "${path_has_file[$f]:-}" "${path_backups[$f]:-}"
             done
-            run rm -rf "${INSTALL_DIR}/users"
-            success "Removed config files"
+            success "Removed/restored config files"
         else
             info "Config files preserved"
         fi
@@ -774,11 +952,24 @@ uninstall_from_manifest() {
 
     run rm -f "$MANIFEST_FILE"
 
+    # Paths that are actually gone (deleted, not restored) after the
+    # above -- used only to make --dry-run's directory-emptiness preview
+    # accurate; see _dir_would_be_empty_excluding.
+    local removed_paths=()
+    for f in "${code_like[@]}"; do
+        [[ "${path_has_file[$f]:-}" == "1" ]] && removed_paths+=("$f")
+    done
+    if $config_confirmed; then
+        for f in "${config_like[@]}"; do
+            [[ "${path_has_file[$f]:-}" == "1" ]] && removed_paths+=("$f")
+        done
+    fi
+
     # Remove directories the installer created, deepest first, and only
     # if now empty (never force-remove a directory with leftover files).
     local d
     for d in $(printf '%s\n' "${manifest_dirs[@]}" | sort -r); do
-        if [[ -d "$d" ]] && [[ -z "$(ls -A "$d" 2>/dev/null)" ]]; then
+        if [[ -d "$d" ]] && _dir_would_be_empty_excluding "$d" "${removed_paths[*]}"; then
             run rmdir "$d"
         fi
     done
@@ -787,8 +978,8 @@ uninstall_from_manifest() {
 # Best-effort removal for installs that predate the manifest. Mirrors
 # the original hardcoded-path behavior of this script.
 uninstall_legacy_fallback() {
-    if [[ -f "/etc/systemd/system/pam-ssh-2fa-server.service" ]]; then
-        run rm -f /etc/systemd/system/pam-ssh-2fa-server.service
+    if [[ -f "$SYSTEMD_UNIT_PATH" ]]; then
+        run rm -f "$SYSTEMD_UNIT_PATH"
         success "Removed systemd service"
     fi
 
@@ -798,6 +989,13 @@ uninstall_legacy_fallback() {
     run rm -f "${INSTALL_DIR}/notify_check.py"
     run rm -f "${INSTALL_DIR}/cleanup_codes.py"
     success "Removed module files"
+
+    local removed_paths=(
+        "${INSTALL_DIR}/${MODULE_FILE}"
+        "${INSTALL_DIR}/approval_server.py"
+        "${INSTALL_DIR}/notify_check.py"
+        "${INSTALL_DIR}/cleanup_codes.py"
+    )
 
     if [[ -f "${INSTALL_DIR}/${CONFIG_FILE}" ]]; then
         local reply="n"
@@ -812,13 +1010,21 @@ uninstall_legacy_fallback() {
             run rm -f "${INSTALL_DIR}/${CONFIG_FILE}"
             run rm -f "${INSTALL_DIR}/${CONFIG_FILE}.new"
             run rm -rf "${INSTALL_DIR}/users"
+            removed_paths+=(
+                "${INSTALL_DIR}/${CONFIG_FILE}"
+                "${INSTALL_DIR}/${CONFIG_FILE}.new"
+                "${INSTALL_DIR}/users"
+            )
             success "Removed config files"
         else
             info "Config files preserved"
         fi
     fi
 
-    if [[ -d "$INSTALL_DIR" ]] && [[ -z "$(ls -A "$INSTALL_DIR" 2>/dev/null)" ]]; then
+    # See _dir_would_be_empty_excluding: makes --dry-run's preview of
+    # this removal accurate, since a dry run never actually deletes the
+    # files above.
+    if [[ -d "$INSTALL_DIR" ]] && _dir_would_be_empty_excluding "$INSTALL_DIR" "${removed_paths[*]}"; then
         run rmdir "$INSTALL_DIR"
         success "Removed empty install directory"
     fi
@@ -1012,5 +1218,11 @@ main() {
     fi
 }
 
-# Run main function
-main "$@"
+# Run main function -- but only when this script is actually being
+# executed, not when a test harness `source`s it to call individual
+# functions (create_directories, install_module, uninstall, etc.)
+# directly against overridden PAM_SSH_2FA_* paths. See
+# test_install_manifest.sh.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

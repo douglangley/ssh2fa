@@ -27,7 +27,7 @@ The safest sequence is:
 5. Package it and provide a transactional installer.
 6. Run a controlled migration and security review.
 
-## Status (re-audited 2026-07-14; Phase 0/1 remediation landed same day)
+## Status (re-audited 2026-07-14; Phase 0/1/2 remediation landed same day)
 
 > **Deep-audit correction:** the first status pass overstated completion.
 > Deterministic concurrency probes proved that one OTP can validate twice and
@@ -38,18 +38,19 @@ The safest sequence is:
 > for evidence, the complete finding set, native Pushover/ntfy direction, and
 > the user-administration CLI plan.
 >
-> **Update, same day:** that plan's Phase 0 (failing regression tests) and
-> Phase 1 (request-state atomicity, config, secret/logging handling) have
-> now landed -- see the `[FIXED]`/`[PARTIAL]` tags on individual findings
-> in `AUDIT_REMEDIATION_AND_ADMIN_PLAN.md`. The installer (P0-6) and
-> PAM/SSH alternatives (P0-7) findings below are **not** part of that
-> work -- they're explicitly Phase 2 in the audit plan's own sequencing
-> and remain open.
+> **Update, same day:** that plan's Phase 0 (failing regression tests),
+> Phase 1 (request-state atomicity, config, secret/logging handling), and
+> Phase 2 (installer manifest/backup-restore correctness, PAM/SSH
+> alternatives) have all now landed -- see the `[FIXED]`/`[PARTIAL]` tags
+> on individual findings in `AUDIT_REMEDIATION_AND_ADMIN_PLAN.md`. Phases
+> 3-6 (native notification providers, admin CLI, unprivileged daemon,
+> packaging) have not started.
 
-Phase 1 (stabilize the current Python implementation) is **substantially
-complete for the request-state/config/secret-logging findings**; the
-installer and PAM/SSH-alternatives findings remain reopened pending Phase 2.
-Every finding below is tagged with its corrected status.
+Phases 1 and 2 (stabilize the current Python implementation; fix the
+installer and PAM/SSH guidance) are both substantially complete -- what
+remains open in each is now narrowly scoped and called out below, rather
+than entire findings being reopened. Every finding below is tagged with
+its corrected status.
 
 | Finding | Status |
 |---|---|
@@ -59,11 +60,11 @@ Every finding below is tagged with its corrected status.
 | High: unescaped values are inserted into HTML | **FIXED** |
 | High: OTP requests can overwrite each other | **FIXED** -- unique request IDs prevent cross-request overwrite, and validation is now atomic (flock + inode-staleness check across the whole read/check/update/delete transition); a barrier-forced concurrent-validation test that used to yield 2 successes out of 20 now reliably yields exactly 1 |
 | High: four-digit OTPs and notification flooding | **FIXED** -- six-digit default, sliding windows, and the concurrent-request cap is now an atomic reservation (`RateLimiter.reserve_request`/`release_request`) instead of a check-then-create race; `both` now reserves one lease, not two |
-| High: the documented PAM stack may not match the promised flow | **PARTIAL, unchanged by this update** -- the primary flow is verified on Debian 13, but optional/group/password alternatives are incorrect and Ubuntu/older Debian remain unverified; this is Phase 2 work |
+| High: the documented PAM stack may not match the promised flow | **FIXED for every alternative that remains published** -- the primary flow, and now the corrected group-skip alternative, are both verified with pamtester on Debian 13. The broken soft-fail alternative was removed rather than fixed (see P0-7), and the broken "password + 2FA" sshd_config alternative was also removed. Ubuntu/older Debian remain unverified (would need a different OS, not just an isolated PAM service on this host) |
 | Medium: the approval service runs as root | **OPEN** -- not started |
-| Medium: the installer exists but leaves risky work manual | **PARTIAL / REOPENED, unchanged by this update** -- see corrected breakdown below; this is Phase 2 work |
+| Medium: the installer exists but leaves risky work manual | **PARTIAL** -- see corrected breakdown below; the core "deletes backups instead of restoring them" bug is fixed, transactional/versioning work remains open |
 | Medium: implementation responsibilities are too concentrated | **OPEN** -- deferred to the Go rewrite (Phases 2-4), not started |
-| Medium: there is no automated test suite | **FIXED as an existence finding** -- 63 tests pass across 9 automated test modules (added `test_atomicity_regressions.py`), plus a manual utility renamed to `notify_check.py` so it's no longer swept up by test discovery; installer and multi-OS PAM coverage is still missing |
+| Medium: there is no automated test suite | **FIXED as an existence finding** -- 67 tests pass across 9 automated Python test modules plus a 13-scenario bash installer test (`test_install_manifest.sh`), plus a manual utility renamed to `notify_check.py` so it's no longer swept up by test discovery; multi-OS PAM coverage is still missing |
 
 **"The installer exists but leaves risky work manual" breakdown:**
 
@@ -73,17 +74,20 @@ Every finding below is tagged with its corrected status.
 | `test_notify.py`/`cleanup_codes.py` documented but not installed | **FIXED** |
 | Uninstall doesn't remove/restore PAM and SSH changes | **OPEN by design** -- the installer still never touches `/etc/pam.d/sshd` or `/etc/ssh/sshd_config` at all (deliberately, see the PAM/SSH finding above), so there's nothing for it to restore yet |
 | Installs the approval server even when link auth isn't wanted | **FIXED** -- now opt-in (`--enable-link-approval`) |
-| Backups not tracked in an installation manifest | **PARTIAL / INCORRECTLY IMPLEMENTED** -- backups are recorded, but uninstall deletes them instead of restoring originals |
+| Backups not tracked in an installation manifest | **FIXED** -- uninstall now reads a path's full manifest history and restores the oldest backup (the true pre-installer original, preserved via `cp -p` and put back via `mv`) instead of deleting it; a freshly-created path (no pre-existing content) is deleted along with any intermediate backups. See P0-6 |
 | Doesn't validate the effective SSH configuration | **PARTIAL** -- `sshd -t`/`sshd -T` are now checked and reported (informational; the installer still doesn't edit SSH config itself) |
-| No transactional rollback | **OPEN** -- uninstall is not precise restoration: it deletes recorded backups; there is no failed-upgrade rollback transaction |
+| No transactional rollback | **PARTIAL** -- uninstall now does precise restoration (see above), but there is still no separate "roll back just the last upgrade" command, and no explicit transaction ID/versioning in the manifest |
 | Doesn't validate end-to-end PAM auth before activation | **PARTIAL** -- clear `pamtester` verification steps are now printed/documented; not run automatically by the installer |
 
-Immediate/Next items from "Suggested priority order" are **mostly fixed now**
-for request-state atomicity, configuration, and secret-logging; the
-installer-restoration and PAM/SSH-alternatives items are not, and are
-explicitly Phase 2 in `AUDIT_REMEDIATION_AND_ADMIN_PLAN.md`'s sequencing.
-The next work should pick up Phase 2 there before the Go daemon or
-administration feature expands the attack surface.
+Immediate/Next items from "Suggested priority order" are now **fixed or
+narrowly partial** across request-state atomicity, configuration,
+secret-logging, the installer's core restore bug, and the PAM/SSH
+alternatives. What remains for Phase 2 (full transaction/versioning
+semantics, a standalone rollback command, multi-OS PAM testing) is
+tracked in `AUDIT_REMEDIATION_AND_ADMIN_PLAN.md`. The next work should
+pick up Phase 3 there (native Pushover/ntfy providers) or close out the
+remaining Phase 2 items, before the Go daemon or administration feature
+expands the attack surface.
 
 ## Repository findings
 
@@ -176,7 +180,7 @@ reservation. Five synchronized callers passed a cap of one. In `both` mode a
 single SSH attempt is also counted as two pending requests. See P0-2 in the
 audit/remediation plan.
 
-### High: the documented PAM stack may not match the promised flow [PARTIAL: primary Debian 13 flow verified]
+### High: the documented PAM stack may not match the promised flow [FIXED for every alternative that remains published]
 
 The example adds the custom module after `@include common-auth`. With keyboard-interactive PAM, the distribution's normal authentication stack may still prompt for and validate a password. Depending on the host configuration, the resulting flow may be SSH key plus password plus push verification rather than SSH key plus push verification.
 
@@ -196,6 +200,28 @@ behavior, the group-skip numeric jump can again leave no PAM success result,
 and the SSH alternative labeled password-plus-2FA is actually 2FA-only with
 the shown PAM stack. Remove those alternatives until they have their own real
 PAM/OpenSSH integration tests.
+
+Phase 2 update: all three re-audited problems above were empirically
+re-tested with pamtester (isolated throwaway PAM service files, never the
+real `/etc/pam.d/sshd`) and resolved. The soft-fail `optional` module was
+confirmed broken, and its "correct" replacement was found to be a genuine
+security anti-pattern (can't distinguish "provider down" from "3 wrong
+codes") -- removed from `examples/pam.d-sshd.example` rather than
+republished. The group-skip jump was confirmed to repeat the `PAM_IGNORE`
+bug (exempt users got "Permission denied") -- fixed with a trailing `auth
+required pam_permit.so` and re-verified for all three cases (exempt
+success, required-and-failing denied, required-and-passing success). The
+sshd_config "password + 2FA" alternative was confirmed incorrect and worse
+than documented (it's 2FA alone, no key and no password, since every
+`keyboard-interactive:pam` hits the same PAM service regardless of which
+`AuthenticationMethods` alternative selected it) -- removed, since there is
+no sshd_config construct that achieves the intended behavior against a
+single PAM service. `pam_ssh_2fa.py`'s own docstring was also fixed to
+match the validated recommendation. See P0-7 in
+AUDIT_REMEDIATION_AND_ADMIN_PLAN.md and
+`test_pam_stack_integration.py::PamStackGroupSkipTests`. Still open:
+Ubuntu and older Debian releases remain untested (this host is Debian 13
+only).
 
 ### Medium: the approval service runs as root [OPEN]
 
@@ -223,6 +249,26 @@ Additional installer issues:
 - It does not validate the effective SSH configuration.
 - It does not provide transactional rollback.
 - It does not fully validate an end-to-end PAM authentication before activation.
+
+Phase 2 update: the manifest-tracking bug (the previous bullet, and the
+core P0-6 finding -- backups were being deleted instead of restored on
+uninstall) is fixed. `uninstall_from_manifest()` now reads a path's full
+manifest history and, for a path that only ever had pre-existing content
+backed up (never freshly created), restores the oldest backup via `mv`
+(same-filesystem rename preserves the `cp -p`-captured mode/ownership/
+timestamp exactly) rather than deleting it. A freshly-created path is
+deleted along with any intermediate upgrade backups, which are not real
+admin content and shouldn't be resurrected. `config.ini.new` and per-user
+example files are now correctly tracked too (previously silently
+overwritten and mis-recorded as freshly created even when they
+pre-existed). Also fixed: `systemctl daemon-reload` timing (previously
+checked after the file it was reloading for was already removed, so it
+almost never ran), approval-service stop/disable now gated on manifest
+ownership, `--dry-run`'s directory-removal preview accuracy, and a
+path-safety check before any manifest-derived mutation. See P0-6 in
+AUDIT_REMEDIATION_AND_ADMIN_PLAN.md and `test_install_manifest.sh` (13
+scenarios). Transactional rollback (a standalone "undo just the last
+upgrade" command, separate from full uninstall) is still not implemented.
 
 ### Medium: implementation responsibilities are too concentrated [OPEN, deferred to Go rewrite]
 
@@ -318,10 +364,14 @@ Updated recommendation for the stated Pushover-and-ntfy-only scope:
 
 Goal: create a safer, tested behavioral reference before changing languages.
 
-**Status: REOPENED.** The first pass did not meet the atomicity, flood-control,
-installer, or PAM-guidance completion criteria. Execute Phases 0-2 of
-`AUDIT_REMEDIATION_AND_ADMIN_PLAN.md` before proceeding to this document's
-Phase 2.
+**Status: substantially complete.** The first pass did not meet the
+atomicity, flood-control, installer, or PAM-guidance completion criteria;
+Phases 0-2 of `AUDIT_REMEDIATION_AND_ADMIN_PLAN.md` have since closed the
+atomicity/flood-control/installer/PAM-guidance gaps (see the `[FIXED]`/
+`[PARTIAL]` tags on individual findings there). What remains -- explicit
+manifest transaction/versioning, a standalone rollback command, and
+multi-OS PAM testing -- is tracked as open items within that plan's
+Phase 2, not a full reopening of this document's Phase 2 below.
 
 - Fix token validation and filename consistency.
 - Change approval to an explicit confirmation POST.
@@ -495,11 +545,11 @@ Goal: replace the Python implementation without risking lockout or changed polic
 - Escape approval-page fields. **FIXED**
 - Add unique request IDs and atomic one-time consumption. **FIXED** -- both OTP validation (`CodeManager._validate_locked`) and approval consumption (`ApprovalManager.consume_approval`) are now atomic under flock + inode-staleness checks
 
-### Next [PARTIAL / REOPENED]
+### Next [MOSTLY FIXED after Phase 2 remediation]
 
-- Add tests and rate limiting. **FIXED** -- suite now 63 tests; the active-request cap is an atomic reservation (`RateLimiter.reserve_request`/`release_request`), no longer a check-then-create race
-- Correct and test the PAM/SSH configuration guidance. **PARTIAL, unchanged** -- primary Debian 13 flow only; alternatives and other platforms remain (Phase 2)
-- Improve the existing installer's validation and rollback behavior. **PARTIAL / INCORRECT, unchanged** -- the manifest records backups but uninstall deletes rather than restores them (Phase 2)
+- Add tests and rate limiting. **FIXED** -- suite now 67 tests; the active-request cap is an atomic reservation (`RateLimiter.reserve_request`/`release_request`), no longer a check-then-create race
+- Correct and test the PAM/SSH configuration guidance. **FIXED for every alternative that remains published** -- the primary flow and the corrected group-skip alternative are both pamtester-verified; the broken soft-fail and "password + 2FA" alternatives were removed rather than fixed. Still Debian 13 only -- other platforms remain untested
+- Improve the existing installer's validation and rollback behavior. **FIXED for the core bug** -- uninstall now restores the true pre-installer original (via manifest path-history + `cp -p`/`mv`) instead of deleting the backup; no transaction ID/versioning or standalone rollback command yet
 
 ### Then [NOT STARTED]
 

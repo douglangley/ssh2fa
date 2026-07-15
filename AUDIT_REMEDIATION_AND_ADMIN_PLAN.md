@@ -2,11 +2,12 @@
 
 Status: proposed after a full repository audit on 2026-07-14; Phase 0 and
 Phase 1 of the "Implementation sequence" below (request-state atomicity,
-configuration, and secret/logging handling) landed the same day. See the
-`[FIXED]`/`[PARTIAL]` tags on individual findings below for exactly what
-changed and what's still open. Phases 2-6 (installer/PAM-SSH
-verification, native providers, admin CLI, unprivileged daemon,
-packaging) have not started.
+configuration, and secret/logging handling) landed the same day, followed
+by Phase 2 (installer manifest/backup-restore correctness, and
+correcting/removing the unverified PAM/SSH alternatives) the same day as
+well. See the `[FIXED]`/`[PARTIAL]` tags on individual findings below for
+exactly what changed and what's still open. Phases 3-6 (native
+providers, admin CLI, unprivileged daemon, packaging) have not started.
 
 This is the implementation plan for the next work. It supersedes the
 "Phase 1 is essentially complete" conclusion in `MODERNIZATION_PLAN.md`.
@@ -340,7 +341,42 @@ Required fix:
 5. Add tests asserting that known secrets never appear in captured stdout,
    stderr, file logs, syslog messages, or HTTP access logs.
 
-### P0-6: installer backups are deleted rather than restored
+### P0-6: installer backups are deleted rather than restored [PARTIAL]
+
+Fixed (the core bug and most correctness defects): `uninstall_from_manifest()`
+now reads a path's FULL manifest history (across every install/upgrade run,
+since the manifest is append-only) rather than just the latest run. A path
+that was ever recorded as `FILE` (freshly created, nothing to restore) is
+deleted along with every backup ever made for it; a path recorded only via
+`BACKUP` restores its OLDEST backup (the true pre-installer original) via
+`mv` and discards any newer, stray backups. `backup_file()` now uses `cp -p`
+so the backup actually preserves the original's mode/ownership/timestamp for
+that later restore to recover. Also fixed: `config.ini.new` and per-user
+example files now go through `install_tracked_file` instead of an
+unconditional overwrite (so a pre-existing one is backed up and correctly
+classified, not silently overwritten and mis-recorded as freshly created);
+`systemctl daemon-reload` now runs based on whether the unit file existed
+*before* removal, not after (previously it almost never actually fired);
+the approval service is now only stopped/disabled if the manifest records
+this installer as the one that put the unit file there (or there's no
+manifest at all, the legacy-install case); `--dry-run`'s directory-removal
+preview is now accurate (`_dir_would_be_empty_excluding()`); every manifest
+path is validated against `manifest_path_is_safe()` before any mutation;
+`umask 077` is set for the whole script. All of the above verified in
+`test_install_manifest.sh` (13 scenarios, source install.sh directly against
+temp-dir path overrides -- no container needed, no risk to a real
+`/etc/pam-ssh-2fa`).
+
+Not done in this pass: no explicit transaction ID / manifest versioning
+(Required fix #1), no separate `CREATED`/`REPLACED`/`SERVICE_STATE`/
+`DIRECTORY` record types (#2, though the path-history grouping approach
+achieves the same practical outcome without them), no standalone "roll back
+just the last upgrade" command (#3 -- only full uninstall's restore
+behavior was fixed), and no `fsync` on manifest/file writes (#6, partial --
+only `umask 077` landed). Disposable-container tests (#7) were not built;
+`test_install_manifest.sh` covers fresh install, repeat install/upgrade,
+config preservation, link-service ownership, dry-run, and path-safety, but
+not "failed mid-upgrade rollback" or "legacy migration" scenarios.
 
 The manifest records `BACKUP|original|backup`, but uninstall stores only the
 backup path and deletes it. It never restores the original. This contradicts
@@ -380,7 +416,50 @@ Required fix:
 Until those tests pass, documentation must not say uninstall is precise or
 that backups are restored.
 
-### P0-7: some documented PAM/SSH alternatives are incorrect
+### P0-7: some documented PAM/SSH alternatives are incorrect [FIXED]
+
+Fixed, all four bullets, each verified empirically with pamtester (never
+reasoned about from the docs alone) using isolated throwaway PAM service
+files -- never the real `/etc/pam.d/sshd`:
+
+- The `auth optional` soft-fail option was confirmed broken exactly as
+  suspected (a failed 2FA check still produced "Permission denied") --
+  AND the corrected construct that does soft-fail
+  (`[success=done default=ignore]` + trailing `pam_permit.so`) was found
+  to be a genuine security anti-pattern: PAM can't distinguish "provider
+  down" from "3 wrong codes", so both get waved through. Removed from
+  `examples/pam.d-sshd.example` rather than republished, with the full
+  empirical finding documented inline.
+- The `pam_succeed_if` group-skip jump was confirmed to repeat the
+  `PAM_IGNORE` bug exactly as suspected: an exempt user got "Permission
+  denied" instead of a free pass, because skipping the only
+  success-producing module left nothing to grant access. Fixed with a
+  trailing `auth required pam_permit.so` line, then re-verified: exempt
+  user succeeds, non-exempt user with failing 2FA is still denied
+  (`required` failure is remembered even though pam_permit.so runs
+  afterward), non-exempt user with correct 2FA succeeds. Regression
+  tests: `test_pam_stack_integration.py::PamStackGroupSkipTests`.
+- The sshd_config "password + 2FA" alternative
+  (`keyboard-interactive:pam keyboard-interactive:pam`) was confirmed
+  incorrect, and more severely than documented: since every
+  `keyboard-interactive:pam` reference hits the identical PAM service
+  regardless of which `AuthenticationMethods` alternative selected it,
+  the second alternative actually means "2FA code alone, no SSH key and
+  no password" -- not a mislabeled password requirement, a full
+  authentication downgrade. There is no sshd_config construct that
+  achieves the intended behavior against a single PAM service, so it was
+  removed from `examples/sshd_config.example` rather than corrected.
+  The other two Match-based alternatives there (per-user, per-network)
+  were verified correct via `sshd -T -C user=...,addr=...` against a
+  standalone copy of each block.
+- `pam_ssh_2fa.py`'s top-of-file docstring was still telling readers to
+  add the module "after @include common-auth" -- fixed to match the
+  validated recommendation (replace it).
+
+Required fix items 3-4 (exhaustive per-stack test matrix, paired `sshd -T
+-C` for every case) are satisfied for the alternatives that survived
+(the primary stack and the corrected group-skip stack); item 5 (keep the
+supported-platform claim to Debian 13) was already true and remains so.
 
 The primary Debian 13 recommendation--replace `common-auth` and require this
 module behind `AuthenticationMethods publickey,keyboard-interactive:pam`--was
@@ -1037,20 +1116,40 @@ Exit criteria:
   warnings. -- met: 63 tests total, `python3 -W error::ResourceWarning -m
   unittest discover` is clean.
 
-### Phase 2: repair installer and PAM/SSH verification
+### Phase 2: repair installer and PAM/SSH verification [DONE for the core bugs; PARTIAL overall]
 
 Goal: eliminate data-loss and lockout guidance risks.
 
-- Implement transactional, reversible manifest semantics.
-- Correct service reload/state ownership and dry-run output.
-- Remove or replace all untested PAM/SSH alternatives.
+- Implement transactional, reversible manifest semantics. -- PARTIAL: no
+  explicit transaction ID/versioning, but path-history grouping
+  (`uninstall_from_manifest()`) achieves correct restore-vs-delete
+  behavior without it. See P0-6.
+- Correct service reload/state ownership and dry-run output. -- DONE.
+  See P0-6.
+- Remove or replace all untested PAM/SSH alternatives. -- DONE, all
+  empirically re-tested. See P0-7.
 - Expand real-stack tests across supported platforms and Match contexts.
+  -- PARTIAL: Debian 13 only (this host); no Ubuntu/other-Debian-release
+  testing was done (would need VMs/containers running a different OS
+  than the host, not just an isolated PAM service file on this one).
 
 Exit criteria:
 
-- Container tests prove install/upgrade/failure/rollback/uninstall behavior.
+- Container tests prove install/upgrade/failure/rollback/uninstall
+  behavior. -- PARTIAL: `test_install_manifest.sh` proves this by
+  sourcing install.sh against temp-dir path overrides (13 scenarios:
+  fresh install, upgrade, restore-on-uninstall, path-safety, dry-run
+  accuracy, service ownership) rather than literal disposable
+  containers; "failed mid-upgrade rollback" and "legacy migration"
+  scenarios are not covered.
 - Pre-existing files are restored byte-for-byte with correct metadata.
-- Each published PAM stack has an integration test on every advertised OS.
+  -- DONE: `backup_file()` now uses `cp -p`, and restore uses `mv`
+  (same-filesystem rename preserves the backup's metadata exactly).
+  Verified in `test_install_manifest.sh`.
+- Each published PAM stack has an integration test on every advertised
+  OS. -- PARTIAL: every stack that remains published (primary, and the
+  corrected group-skip alternative) has a pamtester-driven integration
+  test, but only on Debian 13 (this host), not "every advertised OS".
 
 ### Phase 3: add native providers behind a stable interface
 

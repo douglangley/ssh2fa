@@ -109,11 +109,35 @@ never implies deleting config), `--enable-link-approval` /
   already wrap it).
 - Installation manifest (`${INSTALL_DIR}/.install-manifest`) -- records
   every directory/file created and every backup made before an
-  overwrite (`DIR|path`, `FILE|path`, `BACKUP|original|backup`).
-  `--uninstall` reads this to remove exactly what was installed
-  (`uninstall_from_manifest`); if no manifest exists (pre-existing
-  install), it falls back to hardcoded default paths
-  (`uninstall_legacy_fallback`).
+  overwrite (`DIR|path`, `FILE|path`, `BACKUP|original|backup`), and is
+  append-only across every install/upgrade run (never truncated), so
+  `--uninstall` sees a path's *complete* history, not just the latest
+  run. `uninstall_from_manifest()` uses that full history per path: if a
+  path was ever recorded as `FILE` (freshly created, nothing predates
+  this installer), it's deleted along with every backup ever made for
+  it; if a path has only ever been `BACKUP`ed (something already existed
+  the very first time this installer touched it), the *oldest* backup
+  for that path is restored via `mv` and every newer, stray backup is
+  discarded. This is why `backup_file()` uses `cp -p` (not a plain
+  `cp`) -- the backup has to carry the original's mode/ownership/
+  timestamp, because a same-filesystem `mv` restore later can't recover
+  metadata a plain `cp` never captured. If no manifest exists
+  (pre-existing install), uninstall falls back to hardcoded default
+  paths (`uninstall_legacy_fallback`) instead, since there's no history
+  to restore from.
+- `manifest_path_is_safe()` -- every manifest-derived path is checked
+  against this (must be under `$INSTALL_DIR`, `$STORAGE_DIR`, or equal
+  to `$SYSTEMD_UNIT_PATH`) before any mutating command touches it. A new
+  uninstall code path must not bypass this.
+- `INSTALL_DIR`/`STORAGE_DIR`/`LOG_FILE`/`SYSTEMD_UNIT_PATH` are
+  overridable via `PAM_SSH_2FA_INSTALL_DIR`/`PAM_SSH_2FA_STORAGE_DIR`/
+  `PAM_SSH_2FA_LOG_FILE`/`PAM_SSH_2FA_SYSTEMD_UNIT_PATH` environment
+  variables, and `main "$@"` is guarded behind a `BASH_SOURCE` check --
+  both exist solely so `test_install_manifest.sh` can `source` this
+  script and exercise its functions against a disposable temp directory
+  instead of the real system paths. Never set those env vars for a real
+  install. If you add a new hardcoded system path to this script,
+  parameterize it the same way so it stays testable.
 - `verify_installation()` returns an error *count*, not a boolean --
   the call site branches explicitly on it (`if verify_installation;
   then ... else ... fi`) rather than letting `set -e` handle a nonzero
@@ -121,6 +145,15 @@ never implies deleting config), `--enable-link-approval` /
   it returns the pre-increment value as its exit status, so the first
   increment from 0 evaluates to a "failed" command and silently kills
   the whole script. Use `errors=$((errors + 1))` instead.
+
+If you ever touch the manifest format, `backup_file()`,
+`uninstall_from_manifest()`, `uninstall_legacy_fallback()`, or the
+directory-emptiness logic, run `test_install_manifest.sh` (no root
+required -- it sources install.sh against a temp directory). It's the
+regression suite for AUDIT_REMEDIATION_AND_ADMIN_PLAN.md's P0-6: the
+audit found that uninstall was deleting backups instead of restoring
+them, among other manifest-correctness bugs, all fixed and covered by
+this harness's 13 scenarios.
 
 ## Configuration
 
@@ -288,6 +321,28 @@ paths in `pam_sm_authenticate()`, or the recommended PAM stack in
 actual `pam_python.so` entry point, not just the Python API, and is the
 only test in this repo that would catch a regression of either finding
 above.
+
+**A third finding, same root cause, found via AUDIT_REMEDIATION_AND_ADMIN_PLAN.md's
+P0-7 re-audit:** `examples/pam.d-sshd.example`'s OPTION 4 (skip 2FA for
+users outside a specific group, via `pam_succeed_if`'s `success=1` jump)
+had the identical bug as the `PAM_IGNORE` issue above -- jumping past the
+only module capable of producing `PAM_SUCCESS` left the "skip" path with
+nothing to grant access, so pamtester showed the exempt user getting
+"Permission denied" instead of a free pass. Fixed by adding a trailing
+`auth required pam_permit.so` line after the 2FA module, so the skip path
+has something to succeed against while a `required` 2FA failure is still
+correctly remembered even though PAM continues past it. Regression tests:
+`test_pam_stack_integration.py::PamStackGroupSkipTests`.
+
+OPTION 3 (soft-fail on 2FA failure, via `auth optional`) was also
+re-tested and found to not soft-fail at all when it's the sole auth
+module -- and the corrected construct that DOES achieve soft-fail turned
+out to be a security anti-pattern (PAM can't distinguish "notification
+service down" from "user/attacker entered 3 wrong codes", so both get
+waved through). It was removed from the examples rather than fixed --
+see the comment block in `examples/pam.d-sshd.example` for the full
+empirical finding. If you're ever tempted to re-add a soft-fail PAM
+option, read that comment first.
 
 ### Validated: Request-State Atomicity
 

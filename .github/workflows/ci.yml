@@ -41,3 +41,6 @@ jobs:
         with:
           scandir: "."
           severity: warning
+
+      - name: Installer manifest/backup/restore regression tests
+        run: bash test_install_manifest.sh

@@ -33,6 +33,14 @@
 # re-check here, and including it only adds a hidden, sometimes-fatal
 # extra factor.
 #
+# FURTHER VALIDATION (see AUDIT_REMEDIATION_AND_ADMIN_PLAN.md, P0-7):
+# OPTIONS 3 and 4 below were also empirically re-tested with pamtester.
+# OPTION 3 (soft-fail) turned out not to work as documented, AND the
+# corrected version of it is a genuine security anti-pattern -- it has
+# been removed, not fixed. OPTION 4 (group-skip) was missing a line that
+# made the "skip 2FA" path silently deny access instead of granting it;
+# it has been corrected and re-verified.
+#
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -71,15 +79,41 @@
 # locked out with no indication that 2FA was ever reached.
 
 # -----------------------------------------------------------------------------
-# OPTION 3: Make 2FA optional (soft fail)
+# OPTION 3: Make 2FA optional (soft fail) -- REMOVED, do not use
 # -----------------------------------------------------------------------------
 #
-# If 2FA fails (e.g., notification service down), allow login anyway.
-# Less secure but prevents lockouts. Still replaces common-auth per
-# OPTION 1 -- only the control flag changes.
+# A previous version of this file suggested:
 #
 #   auth optional pam_python.so /etc/pam-ssh-2fa/pam_ssh_2fa.py
 #
+# claiming that if 2FA fails (e.g. notification service down), login
+# would still be allowed. This was never actually verified and, when
+# tested empirically with pamtester (see
+# AUDIT_REMEDIATION_AND_ADMIN_PLAN.md P0-7), turned out to be wrong on
+# two counts:
+#
+#   1. As documented (pam_python.so as the ONLY auth module), it does
+#      NOT soft-fail at all. Linux-PAM's own docs say an "optional"
+#      module's result IS significant when it's the only module in the
+#      stack -- confirmed with pamtester: a failed 2FA check here still
+#      produced "Permission denied", not a login.
+#   2. The construct that DOES achieve genuine soft-fail --
+#        auth [success=done default=ignore] pam_python.so /etc/pam-ssh-2fa/pam_ssh_2fa.py
+#        auth required pam_permit.so
+#      -- is a real security anti-pattern, also confirmed with
+#      pamtester: PAM cannot distinguish "notification service is down"
+#      from "the user (or an attacker) just entered the wrong code three
+#      times". Both return the same kind of failure, and this construct
+#      lets BOTH through. In practice this makes 2FA bypassable by
+#      anyone who simply fails the prompt, not just resilient to a
+#      provider outage.
+#
+# There is no known PAM construct that achieves "let me in if the
+# notification service is down, but still enforce 2FA against a wrong
+# guess" -- PAM has no visibility into *why* an auth module failed. If
+# you need resilience against provider outages, address it at the
+# notification layer (e.g. multiple redundant apprise_urls) rather than
+# by softening the PAM control flag.
 
 # -----------------------------------------------------------------------------
 # OPTION 4: 2FA only for certain users (via PAM succeed_if)
@@ -90,6 +124,23 @@
 #
 #   auth [success=1 default=ignore] pam_succeed_if.so user notingroup require2fa
 #   auth required pam_python.so /etc/pam-ssh-2fa/pam_ssh_2fa.py
+#   auth required pam_permit.so
+#
+# The trailing "pam_permit.so" line is required and was added after
+# empirical testing (AUDIT_REMEDIATION_AND_ADMIN_PLAN.md P0-7) found the
+# two-line version broken: a user who skips the 2FA module via the
+# success=1 jump lands with NO module having produced a definite
+# PAM_SUCCESS, and pamtester confirmed this actually DENIES the exempt
+# user ("Permission denied") -- the same class of bug as the PAM_IGNORE
+# issue documented in CLAUDE.md. With the trailing pam_permit.so:
+#   - a user NOT in the group jumps past 2FA and hits pam_permit.so,
+#     which grants access;
+#   - a user IN the group who fails 2FA is still denied overall, because
+#     a "required" module's failure is remembered even though PAM
+#     continues on to run pam_permit.so afterward;
+#   - a user IN the group who passes 2FA succeeds normally.
+# All three cases were verified empirically with pamtester, not just
+# reasoned about from the Linux-PAM docs.
 #
 # Note: this module's own [bypass] users/networks config.ini setting
 # (see README.md) is usually a simpler way to exempt specific

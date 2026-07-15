@@ -34,8 +34,18 @@ See config.ini for all available options.
 
 PAM CONFIGURATION
 -----------------
-Add to /etc/pam.d/sshd (after @include common-auth or as needed):
+In /etc/pam.d/sshd, REPLACE the "@include common-auth" line with:
     auth required pam_python.so /etc/pam-ssh-2fa/pam_ssh_2fa.py
+
+Do NOT add this line after "@include common-auth" -- empirically verified
+with pamtester (see examples/pam.d-sshd.example and
+CLAUDE.md's "Validated: PAM Stack Composition") to silently require a
+working Unix password before 2FA is even attempted, which makes login
+completely impossible for password-locked (SSH-key-only) accounts, this
+module's primary target. SSH key verification already happened at the
+OpenSSH layer before this PAM stack is ever invoked (it only runs for the
+keyboard-interactive step), so there is nothing for common-auth to
+usefully re-check here.
 
 SSH CONFIGURATION
 -----------------
