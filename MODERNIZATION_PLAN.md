@@ -27,27 +27,35 @@ The safest sequence is:
 5. Package it and provide a transactional installer.
 6. Run a controlled migration and security review.
 
-## Status (as of 2026-07-14)
+## Status (re-audited 2026-07-14)
 
-Phase 1 (stabilize the current Python implementation) is essentially
-complete. Every finding below is tagged with its current status; this
-section is updated as work lands, while the findings themselves are left
-as originally written (they're still accurate descriptions of what *was*
-wrong, and the fixes reference them).
+> **Deep-audit correction:** the first status pass overstated completion.
+> Deterministic concurrency probes proved that one OTP can validate twice and
+> that five requests can pass a configured concurrent cap of one. The
+> installer records backups but deletes rather than restores them during
+> uninstall, and several untested PAM/SSH alternatives are incorrect. See
+> [AUDIT_REMEDIATION_AND_ADMIN_PLAN.md](AUDIT_REMEDIATION_AND_ADMIN_PLAN.md)
+> for evidence, the complete finding set, native Pushover/ntfy direction, and
+> the user-administration CLI plan.
+
+Phase 1 (stabilize the current Python implementation) is **not complete**.
+The first implementation pass fixed important surface issues, but the deeper
+audit reopened atomicity, flood-control, bearer-secret, installer, and PAM
+guidance work. Every finding below is tagged with its corrected status.
 
 | Finding | Status |
 |---|---|
 | Critical: approval token handling is inconsistent | **FIXED** |
 | Critical: a GET request approves an SSH login | **FIXED** |
-| High: approval links are bearer credentials | **FIXED** |
+| High: approval links are bearer credentials | **PARTIAL** -- public HTTP is rejected, but debug HTTP logging includes full approval-token paths and private/non-global HTTP is trusted too broadly |
 | High: unescaped values are inserted into HTML | **FIXED** |
-| High: OTP requests can overwrite each other | **FIXED** |
-| High: four-digit OTPs and notification flooding | **FIXED** |
-| High: the documented PAM stack may not match the promised flow | **FIXED** on Debian 13 (empirically, via `pamtester`); not yet verified on Ubuntu or older Debian releases |
+| High: OTP requests can overwrite each other | **PARTIAL** -- unique request IDs prevent cross-request overwrite, but same-request validation/attempt transitions are not atomic and one OTP can validate twice |
+| High: four-digit OTPs and notification flooding | **PARTIAL** -- six-digit default and sliding windows work, but the concurrent cap is a check-then-create race and `both` counts one attempt twice |
+| High: the documented PAM stack may not match the promised flow | **PARTIAL** -- the primary flow is verified on Debian 13, but optional/group/password alternatives are incorrect and Ubuntu/older Debian remain unverified |
 | Medium: the approval service runs as root | **OPEN** -- not started |
-| Medium: the installer exists but leaves risky work manual | **PARTIAL** -- see breakdown below |
+| Medium: the installer exists but leaves risky work manual | **PARTIAL / REOPENED** -- see corrected breakdown below |
 | Medium: implementation responsibilities are too concentrated | **OPEN** -- deferred to the Go rewrite (Phases 2-4), not started |
-| Medium: there is no automated test suite | **FIXED** -- 52 tests across 9 files, including a real PAM-integration suite (`test_pam_stack_integration.py`) |
+| Medium: there is no automated test suite | **FIXED as an existence finding** -- 52 tests pass across 8 actual automated test modules, plus a manual utility named `test_notify.py`; important race, lifecycle, provider, and installer coverage is still missing |
 
 **"The installer exists but leaves risky work manual" breakdown:**
 
@@ -57,14 +65,14 @@ wrong, and the fixes reference them).
 | `test_notify.py`/`cleanup_codes.py` documented but not installed | **FIXED** |
 | Uninstall doesn't remove/restore PAM and SSH changes | **OPEN by design** -- the installer still never touches `/etc/pam.d/sshd` or `/etc/ssh/sshd_config` at all (deliberately, see the PAM/SSH finding above), so there's nothing for it to restore yet |
 | Installs the approval server even when link auth isn't wanted | **FIXED** -- now opt-in (`--enable-link-approval`) |
-| Backups not tracked in an installation manifest | **FIXED** |
+| Backups not tracked in an installation manifest | **PARTIAL / INCORRECTLY IMPLEMENTED** -- backups are recorded, but uninstall deletes them instead of restoring originals |
 | Doesn't validate the effective SSH configuration | **PARTIAL** -- `sshd -t`/`sshd -T` are now checked and reported (informational; the installer still doesn't edit SSH config itself) |
-| No transactional rollback | **OPEN** -- `--uninstall` is now manifest-driven and precise, but there's no separate "roll back just the last upgrade" command |
+| No transactional rollback | **OPEN** -- uninstall is not precise restoration: it deletes recorded backups; there is no failed-upgrade rollback transaction |
 | Doesn't validate end-to-end PAM auth before activation | **PARTIAL** -- clear `pamtester` verification steps are now printed/documented; not run automatically by the installer |
 
-Immediate/Next items from "Suggested priority order" below are all
-**FIXED**. Remaining work is entirely in the "Then" tier (Go daemon
-rewrite, Phases 2-6) plus the two "Medium: OPEN" items above.
+Immediate/Next items from "Suggested priority order" are **not all fixed**.
+The next work must return to Phase 1 and complete the reopened items before the
+Go daemon or administration feature expands the attack surface.
 
 ## Repository findings
 
@@ -92,7 +100,7 @@ Recommended changes:
 - Make approval consumption atomic and single-use.
 - Clearly display the SSH username, host, source address, and request time before confirmation.
 
-### High: approval links are bearer credentials [FIXED]
+### High: approval links are bearer credentials [PARTIAL]
 
 The documentation presents plain HTTP as a normal public deployment option. Anyone able to observe an approval URL in transit can approve the associated login.
 
@@ -102,6 +110,11 @@ Recommended changes:
 - Support deployment behind a TLS reverse proxy.
 - Reject insecure public server URLs by default.
 - Avoid logging full URLs or tokens.
+
+Re-audit note: transport enforcement was added, but the approval server's
+debug `log_message()` still records the complete request line containing the
+bearer token. Reverse-proxy access-log redaction is also undocumented. This
+finding remains partial until secret-canary logging tests pass.
 
 ### High: unescaped values are inserted into HTML [FIXED]
 
@@ -114,7 +127,7 @@ Recommended changes:
 - Add `X-Content-Type-Options: nosniff`, clickjacking protection, and a strict referrer policy.
 - Avoid placing sensitive tokens in outbound referrer information.
 
-### High: OTP requests can overwrite each other [FIXED]
+### High: OTP requests can overwrite each other [PARTIAL]
 
 OTP state is named only from the username and remote address. Two simultaneous connections by the same user from the same NAT address share a state file, so one connection can replace the other connection's code.
 
@@ -128,7 +141,13 @@ Recommended changes:
 - Ensure successful codes and approvals can be consumed exactly once.
 - Add concurrency and replay tests.
 
-### High: four-digit OTPs and notification flooding [FIXED]
+Re-audit note: unique per-request IDs fixed collisions between different
+attempts, but `validate()` does not lock the complete read/check/update/delete
+transition. A deterministic audit probe made two concurrent validations of
+one OTP both return success. Failed-attempt writes can also race a successful
+unlink and recreate state. See P0-1 in the audit/remediation plan.
+
+### High: four-digit OTPs and notification flooding [PARTIAL]
 
 A four-digit code has only 10,000 possibilities. The three-attempt limit helps within one request, but an attacker can repeatedly initiate authentication to obtain new guessing windows and generate notification spam.
 
@@ -140,7 +159,13 @@ Recommended changes:
 - Add notification cooldowns and flood detection.
 - Avoid revealing whether an account is configured through externally visible behavior.
 
-### High: the documented PAM stack may not match the promised flow [FIXED on Debian 13, not yet verified on Ubuntu/older Debian]
+Re-audit note: the six-digit default and sliding-window files are in place,
+but the active-request cap scans and later creates state without one atomic
+reservation. Five synchronized callers passed a cap of one. In `both` mode a
+single SSH attempt is also counted as two pending requests. See P0-2 in the
+audit/remediation plan.
+
+### High: the documented PAM stack may not match the promised flow [PARTIAL: primary Debian 13 flow verified]
 
 The example adds the custom module after `@include common-auth`. With keyboard-interactive PAM, the distribution's normal authentication stack may still prompt for and validate a password. Depending on the host configuration, the resulting flow may be SSH key plus password plus push verification rather than SSH key plus push verification.
 
@@ -153,6 +178,13 @@ Recommended changes:
 - Test success, rejection, unavailable service, unknown user, bypass, and cancellation return paths.
 - Verify the final SSH configuration with both `sshd -t` and `sshd -T`.
 - Document console and break-glass recovery before activation.
+
+Re-audit note: the primary Debian 13 key-plus-2FA stack is verified. However,
+the documented sole `optional` module does not provide the claimed soft-fail
+behavior, the group-skip numeric jump can again leave no PAM success result,
+and the SSH alternative labeled password-plus-2FA is actually 2FA-only with
+the shown PAM stack. Remove those alternatives until they have their own real
+PAM/OpenSSH integration tests.
 
 ### Medium: the approval service runs as root [OPEN]
 
@@ -256,19 +288,29 @@ The Go daemon should own:
 
 The existing implementation obtains more than 80 provider integrations through Apprise. A native Go implementation will not automatically preserve that coverage.
 
-Recommended approach:
+Updated recommendation for the stated Pushover-and-ntfy-only scope:
 
 - Define a small notifier interface.
-- Initially support ntfy, Pushover, Telegram, and generic HTTPS webhooks.
+- Implement native ntfy and Pushover providers with typed configuration,
+  strict deadlines, response limits, TLS verification, and secret redaction.
 - Allow several notifiers per user for redundancy.
-- Keep an optional external Apprise adapter for users who need providers not implemented natively.
+- Keep an optional legacy Apprise adapter for one migration window rather than
+  making Apprise a permanent mandatory dependency.
 - Put explicit connection, TLS, response-size, and total request timeouts on every provider.
+- Add a root-only user/provider administration CLI before considering any web
+  admin surface. See `AUDIT_REMEDIATION_AND_ADMIN_PLAN.md` for the command and
+  config design.
 
 ## Phased implementation plan
 
 ### Phase 1: stabilize the current implementation
 
 Goal: create a safer, tested behavioral reference before changing languages.
+
+**Status: REOPENED.** The first pass did not meet the atomicity, flood-control,
+installer, or PAM-guidance completion criteria. Execute Phases 0-2 of
+`AUDIT_REMEDIATION_AND_ADMIN_PLAN.md` before proceeding to this document's
+Phase 2.
 
 - Fix token validation and filename consistency.
 - Change approval to an explicit confirmation POST.
@@ -434,19 +476,19 @@ Goal: replace the Python implementation without risking lockout or changed polic
 
 ## Suggested priority order
 
-### Immediate [ALL FIXED]
+### Immediate [REOPENED AFTER DEEP AUDIT]
 
 - Fix link token lookup. **FIXED**
 - Prevent GET/link-preview approval. **FIXED**
-- Require explicit HTTPS guidance. **FIXED**
+- Require explicit HTTPS guidance. **PARTIAL** -- transport gate exists; token logging/private-HTTP policy still need work
 - Escape approval-page fields. **FIXED**
-- Add unique request IDs and atomic one-time consumption. **FIXED**
+- Add unique request IDs and atomic one-time consumption. **PARTIAL** -- IDs fixed; consumption is not atomic
 
-### Next [ALL FIXED]
+### Next [PARTIAL / REOPENED]
 
-- Add tests and rate limiting. **FIXED**
-- Correct and test the PAM/SSH configuration guidance. **FIXED** (Debian 13; Ubuntu/older Debian not yet verified)
-- Improve the existing installer's validation and rollback behavior. **FIXED** (manifest-driven uninstall, dry-run; no separate rollback-of-last-upgrade command)
+- Add tests and rate limiting. **PARTIAL** -- suite and window limits exist; active-request reservation races and coverage gaps remain
+- Correct and test the PAM/SSH configuration guidance. **PARTIAL** -- primary Debian 13 flow only; alternatives and other platforms remain
+- Improve the existing installer's validation and rollback behavior. **PARTIAL / INCORRECT** -- the manifest records backups but uninstall deletes rather than restores them
 
 ### Then [NOT STARTED]
 
