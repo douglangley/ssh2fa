@@ -27,9 +27,48 @@ The safest sequence is:
 5. Package it and provide a transactional installer.
 6. Run a controlled migration and security review.
 
+## Status (as of 2026-07-14)
+
+Phase 1 (stabilize the current Python implementation) is essentially
+complete. Every finding below is tagged with its current status; this
+section is updated as work lands, while the findings themselves are left
+as originally written (they're still accurate descriptions of what *was*
+wrong, and the fixes reference them).
+
+| Finding | Status |
+|---|---|
+| Critical: approval token handling is inconsistent | **FIXED** |
+| Critical: a GET request approves an SSH login | **FIXED** |
+| High: approval links are bearer credentials | **FIXED** |
+| High: unescaped values are inserted into HTML | **FIXED** |
+| High: OTP requests can overwrite each other | **FIXED** |
+| High: four-digit OTPs and notification flooding | **FIXED** |
+| High: the documented PAM stack may not match the promised flow | **FIXED** on Debian 13 (empirically, via `pamtester`); not yet verified on Ubuntu or older Debian releases |
+| Medium: the approval service runs as root | **OPEN** -- not started |
+| Medium: the installer exists but leaves risky work manual | **PARTIAL** -- see breakdown below |
+| Medium: implementation responsibilities are too concentrated | **OPEN** -- deferred to the Go rewrite (Phases 2-4), not started |
+| Medium: there is no automated test suite | **FIXED** -- 52 tests across 9 files, including a real PAM-integration suite (`test_pam_stack_integration.py`) |
+
+**"The installer exists but leaves risky work manual" breakdown:**
+
+| Sub-issue | Status |
+|---|---|
+| Installs Apprise with `--break-system-packages` unconditionally | **IMPROVED** -- now tries a plain install first, falls back only on a real PEP 668 error |
+| `test_notify.py`/`cleanup_codes.py` documented but not installed | **FIXED** |
+| Uninstall doesn't remove/restore PAM and SSH changes | **OPEN by design** -- the installer still never touches `/etc/pam.d/sshd` or `/etc/ssh/sshd_config` at all (deliberately, see the PAM/SSH finding above), so there's nothing for it to restore yet |
+| Installs the approval server even when link auth isn't wanted | **FIXED** -- now opt-in (`--enable-link-approval`) |
+| Backups not tracked in an installation manifest | **FIXED** |
+| Doesn't validate the effective SSH configuration | **PARTIAL** -- `sshd -t`/`sshd -T` are now checked and reported (informational; the installer still doesn't edit SSH config itself) |
+| No transactional rollback | **OPEN** -- `--uninstall` is now manifest-driven and precise, but there's no separate "roll back just the last upgrade" command |
+| Doesn't validate end-to-end PAM auth before activation | **PARTIAL** -- clear `pamtester` verification steps are now printed/documented; not run automatically by the installer |
+
+Immediate/Next items from "Suggested priority order" below are all
+**FIXED**. Remaining work is entirely in the "Then" tier (Go daemon
+rewrite, Phases 2-6) plus the two "Medium: OPEN" items above.
+
 ## Repository findings
 
-### Critical: approval token handling is inconsistent
+### Critical: approval token handling is inconsistent [FIXED]
 
 The PAM module generates URL-safe tokens that may contain letters, digits, `-`, and `_`. It uses those exact characters when naming approval files.
 
@@ -41,7 +80,7 @@ Recommended changes:
 - Reject tokens that do not match the format instead of modifying them.
 - Add tests containing `-` and `_`, malformed tokens, and traversal attempts.
 
-### Critical: a GET request approves an SSH login
+### Critical: a GET request approves an SSH login [FIXED]
 
 Opening `/approve/<token>` immediately approves the pending authentication request. Notification services, chat applications, email systems, browsers, and security products commonly preview or scan links automatically. A scanner could therefore approve a login without an intentional user action.
 
@@ -53,7 +92,7 @@ Recommended changes:
 - Make approval consumption atomic and single-use.
 - Clearly display the SSH username, host, source address, and request time before confirmation.
 
-### High: approval links are bearer credentials
+### High: approval links are bearer credentials [FIXED]
 
 The documentation presents plain HTTP as a normal public deployment option. Anyone able to observe an approval URL in transit can approve the associated login.
 
@@ -64,7 +103,7 @@ Recommended changes:
 - Reject insecure public server URLs by default.
 - Avoid logging full URLs or tokens.
 
-### High: unescaped values are inserted into HTML
+### High: unescaped values are inserted into HTML [FIXED]
 
 The approval page places the username, hostname, and remote host directly into HTML output.
 
@@ -75,7 +114,7 @@ Recommended changes:
 - Add `X-Content-Type-Options: nosniff`, clickjacking protection, and a strict referrer policy.
 - Avoid placing sensitive tokens in outbound referrer information.
 
-### High: OTP requests can overwrite each other
+### High: OTP requests can overwrite each other [FIXED]
 
 OTP state is named only from the username and remote address. Two simultaneous connections by the same user from the same NAT address share a state file, so one connection can replace the other connection's code.
 
@@ -89,7 +128,7 @@ Recommended changes:
 - Ensure successful codes and approvals can be consumed exactly once.
 - Add concurrency and replay tests.
 
-### High: four-digit OTPs and notification flooding
+### High: four-digit OTPs and notification flooding [FIXED]
 
 A four-digit code has only 10,000 possibilities. The three-attempt limit helps within one request, but an attacker can repeatedly initiate authentication to obtain new guessing windows and generate notification spam.
 
@@ -101,7 +140,7 @@ Recommended changes:
 - Add notification cooldowns and flood detection.
 - Avoid revealing whether an account is configured through externally visible behavior.
 
-### High: the documented PAM stack may not match the promised flow
+### High: the documented PAM stack may not match the promised flow [FIXED on Debian 13, not yet verified on Ubuntu/older Debian]
 
 The example adds the custom module after `@include common-auth`. With keyboard-interactive PAM, the distribution's normal authentication stack may still prompt for and validate a password. Depending on the host configuration, the resulting flow may be SSH key plus password plus push verification rather than SSH key plus push verification.
 
@@ -115,7 +154,7 @@ Recommended changes:
 - Verify the final SSH configuration with both `sshd -t` and `sshd -T`.
 - Document console and break-glass recovery before activation.
 
-### Medium: the approval service runs as root
+### Medium: the approval service runs as root [OPEN]
 
 The network-facing Python approval server currently runs as root. Some systemd hardening is present, but a remotely reachable process should not have root privileges when it can be avoided.
 
@@ -127,7 +166,7 @@ Recommended changes:
 - Restrict writable paths to a dedicated runtime directory.
 - Add stronger systemd sandboxing and syscall restrictions after compatibility testing.
 
-### Medium: the installer exists but leaves risky work manual
+### Medium: the installer exists but leaves risky work manual [PARTIAL, see Status section above]
 
 The repository already contains an interactive `install.sh`, but it deliberately stops before modifying PAM and SSH. This leaves the most error-prone steps to the user.
 
@@ -142,7 +181,7 @@ Additional installer issues:
 - It does not provide transactional rollback.
 - It does not fully validate an end-to-end PAM authentication before activation.
 
-### Medium: implementation responsibilities are too concentrated
+### Medium: implementation responsibilities are too concentrated [OPEN, deferred to Go rewrite]
 
 The main PAM module is approximately 2,000 lines and combines:
 
@@ -158,7 +197,7 @@ The main PAM module is approximately 2,000 lines and combines:
 
 This makes security review, testing, and failure isolation harder. Network calls and complex provider parsing also occur in the privileged SSH authentication process.
 
-### Medium: there is no automated test suite
+### Medium: there is no automated test suite [FIXED]
 
 The Python files pass compilation checks and the shell installer passes `bash -n`, but the repository has no unit or integration test suite. `test_notify.py` is a manual diagnostic utility.
 
@@ -395,21 +434,21 @@ Goal: replace the Python implementation without risking lockout or changed polic
 
 ## Suggested priority order
 
-### Immediate
+### Immediate [ALL FIXED]
 
-- Fix link token lookup.
-- Prevent GET/link-preview approval.
-- Require explicit HTTPS guidance.
-- Escape approval-page fields.
-- Add unique request IDs and atomic one-time consumption.
+- Fix link token lookup. **FIXED**
+- Prevent GET/link-preview approval. **FIXED**
+- Require explicit HTTPS guidance. **FIXED**
+- Escape approval-page fields. **FIXED**
+- Add unique request IDs and atomic one-time consumption. **FIXED**
 
-### Next
+### Next [ALL FIXED]
 
-- Add tests and rate limiting.
-- Correct and test the PAM/SSH configuration guidance.
-- Improve the existing installer's validation and rollback behavior.
+- Add tests and rate limiting. **FIXED**
+- Correct and test the PAM/SSH configuration guidance. **FIXED** (Debian 13; Ubuntu/older Debian not yet verified)
+- Improve the existing installer's validation and rollback behavior. **FIXED** (manifest-driven uninstall, dry-run; no separate rollback-of-last-upgrade command)
 
-### Then
+### Then [NOT STARTED]
 
 - Specify the Unix-socket protocol.
 - Build the Go daemon.

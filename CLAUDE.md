@@ -18,11 +18,11 @@ pam-ssh-2fa/
 |-- pam_ssh_2fa.py          # Main PAM module (~2600 lines)
 |-- approval_server.py      # HTTP server for link-based auth (~950 lines)
 |-- config.ini              # Global configuration (~400 lines)
-|-- install.sh              # Installation script (~980 lines)
+|-- install.sh              # Installation script (~1020 lines)
 |-- test_notify.py          # Notification testing utility (~320 lines)
 |-- cleanup_codes.py        # Expired code cleanup utility (~210 lines)
 |-- pam-ssh-2fa-server.service  # Systemd service for approval server
-|-- README.md               # User documentation (~740 lines)
+|-- README.md               # User documentation (~790 lines)
 |-- CLAUDE.md               # This file
 |-- MODERNIZATION_PLAN.md   # Security audit and roadmap
 |-- test_*.py               # Automated test suite (unittest)
@@ -161,6 +161,7 @@ body_both = Click: {link} Or code: {code}     # Combined template
 
 [server]
 port = 9110                             # Approval server port
+bind_address = 0.0.0.0                  # Interface the approval server binds to
 url =                                   # Public URL (REQUIRED for link auth)
                                          # http:// rejected for public hosts by default
 allow_insecure_http = false             # Override the http:// rejection above
@@ -340,8 +341,8 @@ above.
 
 ### Adding a New Auth Method
 
-1. Add to validation in `pam_sm_authenticate()` (~line 2048)
-2. Add handling logic in the Step 7 section (~line 2215)
+1. Add to validation in `pam_sm_authenticate()` (~line 2061)
+2. Add handling logic in the Step 7 section (~line 2228)
 3. Update config.ini comments
 4. Update README.md Authentication Methods section
 5. Update per-user example configs

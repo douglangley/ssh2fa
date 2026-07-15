@@ -509,6 +509,7 @@ Required for link-based authentication (`auth_method = link` or `both`):
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `port` | `9110` | Port the approval server listens on |
+| `bind_address` | `0.0.0.0` | Interface the approval server binds to. Restrict to a private IP (e.g. `127.0.0.1` behind a reverse proxy) to reduce exposure |
 | `url` | (empty) | Public URL for approval links (REQUIRED for link auth). See [HTTPS for the Approval Server](#https-for-the-approval-server) -- `http://` is rejected for public hosts by default |
 | `allow_insecure_http` | `false` | If true, permit `http://` in `url` even for a public host (not recommended) |
 | `tls_cert` | (empty) | PEM certificate (chain) path; serves HTTPS natively when set with `tls_key` |
@@ -705,17 +706,21 @@ curl https://your-server:9110/health
 ```
 /etc/pam-ssh-2fa/
 |-- pam_ssh_2fa.py         # Main PAM module (Python)
-|-- approval_server.py     # Approval server for link-based auth
+|-- approval_server.py     # Approval server, only if --enable-link-approval
+|-- test_notify.py         # Manual notification testing utility
+|-- cleanup_codes.py       # Cron-driven expired-code cleanup utility
 |-- config.ini             # Global configuration file
+|-- .install-manifest      # What install.sh created, for precise --uninstall
 +-- users/                 # Per-user configuration directory
     |-- doug.conf          # Doug's notification settings
     +-- ben.conf           # Ben's notification settings
 
 /etc/systemd/system/
-+-- pam-ssh-2fa-server.service  # Systemd service for approval server
++-- pam-ssh-2fa-server.service  # Systemd service, only if --enable-link-approval
 
 /var/run/pam-ssh-2fa/      # Runtime storage (tmpfs recommended)
 |-- code_*.json            # OTP code files
+|-- ratelimit/             # Per-user/per-source rate-limit counters
 +-- approvals/             # Approval request files
     +-- <token>.json
 
