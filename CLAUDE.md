@@ -250,6 +250,44 @@ method = link    # code, link, both, none
 5. If user presses Enter: check if link was clicked
 6. Either method grants access
 
+### Validated: PAM Stack Composition
+
+Per MODERNIZATION_PLAN.md's "the documented PAM stack may not match the
+promised flow" finding, this was tested empirically with `pamtester`
+against a real PAM stack (not just reasoned about) on Debian 13, and the
+results are encoded as regression tests in
+`test_pam_stack_integration.py`. Two findings drove real fixes:
+
+1. **The `/etc/pam.d/sshd` auth stack must NOT include `@include
+   common-auth`.** SSH key verification already happened at the OpenSSH
+   layer before this stack is ever invoked (it only runs for the
+   keyboard-interactive step tagged `:pam`). Confirmed with pamtester:
+   adding this module AFTER `@include common-auth` makes `pam_unix.so`
+   prompt for and validate a Unix password FIRST -- if it's wrong,
+   `pam_deny.so requisite` aborts the whole stack immediately and this
+   module never even runs. For a password-locked (SSH-key-only) account
+   -- this module's primary target -- login becomes impossible, full
+   stop, regardless of 2FA. Fix: `examples/pam.d-sshd.example` now says
+   to REPLACE `@include common-auth`, not follow it.
+
+2. **`BypassChecker`-triggered bypass must return `PAM_SUCCESS`, not
+   `PAM_IGNORE`.** `PAM_IGNORE` tells libpam to disregard this module's
+   result and let some other module's result decide overall success --
+   but once fix #1 is applied, this module is the ONLY auth line in the
+   stack, so there's nothing else to decide it. Confirmed with
+   pamtester: a bypassed user got "Permission denied" even though
+   `should_bypass()` correctly logged the bypass. This was a real bug in
+   `pam_sm_authenticate()` (Step 3), not just a docs issue -- fixed by
+   returning `PAM_SUCCESS` instead.
+
+If you ever touch `BypassChecker`, the bypass/unconfigured-user return
+paths in `pam_sm_authenticate()`, or the recommended PAM stack in
+`examples/pam.d-sshd.example`, run `test_pam_stack_integration.py`
+(requires root + `pamtester`; skips itself otherwise) -- it drives the
+actual `pam_python.so` entry point, not just the Python API, and is the
+only test in this repo that would catch a regression of either finding
+above.
+
 ## Code Conventions
 
 ### Accessibility
@@ -313,6 +351,11 @@ method = link    # code, link, both, none
 1. Add check method to `BypassChecker` class (~line 1578)
 2. Call from `should_bypass()` method
 3. Add config option following "Adding a New Config Option"
+4. Do not change the bypass return code in `pam_sm_authenticate()` away
+   from `PAM_SUCCESS` -- see "Validated: PAM Stack Composition" above
+   for why `PAM_IGNORE` looks equally plausible but silently denies
+   instead of granting access. Run `test_pam_stack_integration.py`
+   after any change here.
 
 ### Adding a New Rate Limit
 
@@ -368,10 +411,18 @@ python3 /etc/pam-ssh-2fa/test_notify.py --url "ntfy://ntfy.sh/test"
 
 ### Test PAM Module Without SSH
 
+Manual, ad-hoc check against your own real `/etc/pam.d/sshd` -- only run
+this on a box where you understand and accept the risk of testing your
+actual login stack:
+
 ```bash
 sudo apt install pamtester
 sudo pamtester sshd yourusername authenticate
 ```
+
+For an automated, repeatable check that doesn't touch a real `sshd` PAM
+service at all (it creates and tears down its own isolated PAM service
+file), see `test_pam_stack_integration.py` under Testing below.
 
 ### Test Approval Server
 
@@ -385,6 +436,22 @@ curl http://localhost:9110/health
 # Check logs
 tail -f /var/log/pam-ssh-2fa-server.log
 ```
+
+### Automated Test Suite (unittest)
+
+```bash
+python3 -m unittest discover -p "test_*.py"
+```
+
+Most `test_*.py` files are pure-Python unit tests with no special
+requirements. One exception: `test_pam_stack_integration.py` drives the
+real `pam_python.so` entry point via `pamtester` against an isolated PAM
+service it creates and tears down itself (never the real `sshd`
+service). It requires root and `pamtester`, and skips itself cleanly
+(with a stated reason) if either is missing, or if a real install
+already exists at `/etc/pam-ssh-2fa` (so it never touches a genuine
+deployment). This is the regression suite for the PAM stack findings in
+"Validated: PAM Stack Composition" above.
 
 ### Self-Test Mode
 
@@ -430,10 +497,13 @@ pip3 install apprise --break-system-packages
 
 | Code | Constant | Meaning |
 |------|----------|---------|
-| 0 | PAM_SUCCESS | Authentication successful |
+| 0 | PAM_SUCCESS | Authentication successful, OR 2FA bypassed (bypass list, or allow_unconfigured_users=true) |
 | 7 | PAM_AUTH_ERR | Authentication failed |
 | 9 | PAM_AUTHINFO_UNAVAIL | Cannot obtain auth info (notification failed) |
-| 25 | PAM_IGNORE | Skip this module (bypass condition met) |
+| 10 | PAM_USER_UNKNOWN | Could not get username from PAM |
+| 11 | PAM_MAXTRIES | Rate limit exceeded (per-user, per-source, or too many concurrent requests) |
+
+Bypass intentionally returns `PAM_SUCCESS`, not `PAM_IGNORE`. `PAM_IGNORE` (25, still defined as a constant) tells the PAM framework to disregard this module's result and defer to some OTHER module in the stack -- but the recommended stack (see `examples/pam.d-sshd.example`) has no other auth module, since SSH key verification already happened at the OpenSSH layer. Verified with `pamtester`: `PAM_IGNORE` there resolved to an overall **deny**, not a pass-through. See `test_pam_stack_integration.py`.
 
 ## File Permissions
 
@@ -460,7 +530,8 @@ mailto://user:pass@smtp/to=addr   # Email
 
 ### SSH/PAM Configuration
 
-**/etc/pam.d/sshd:**
+**/etc/pam.d/sshd** -- REPLACE `@include common-auth`, don't add after it
+(see "Validated: PAM Stack Composition" below for why this is load-bearing):
 ```
 auth required pam_python.so /etc/pam-ssh-2fa/pam_ssh_2fa.py
 ```
@@ -471,6 +542,10 @@ UsePAM yes
 KbdInteractiveAuthentication yes
 AuthenticationMethods publickey,keyboard-interactive:pam
 ```
+
+Verify with `sshd -t` (syntax) AND `sshd -T | grep -iE '^(usepam|kbdinteractiveauthentication|authenticationmethods)'`
+(effective/resolved config -- `sshd -t` alone won't catch a Match block
+overriding these elsewhere in the file).
 
 ### Systemd Commands
 

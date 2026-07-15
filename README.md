@@ -166,11 +166,19 @@ Check your phone - you should receive a test code!
 
 ### 4. Configure PAM
 
-Add to `/etc/pam.d/sshd` (after `@include common-auth`):
+In `/etc/pam.d/sshd`, **replace** this line:
+
+```
+@include common-auth
+```
+
+with:
 
 ```
 auth required pam_python.so /etc/pam-ssh-2fa/pam_ssh_2fa.py
 ```
+
+Do not just add the module *after* `@include common-auth` -- see [examples/pam.d-sshd.example](examples/pam.d-sshd.example) for why that was tested and found to be wrong: it silently adds a Unix password requirement before 2FA is even attempted (so the real flow becomes "SSH key + Unix password + push code", not "SSH key + push code"), and it makes login **completely impossible** for password-locked, SSH-key-only accounts -- which is likely how your accounts are set up if you're using this module. `examples/pam.d-sshd.example` also has an intentional three-factor option (key + password + push) for anyone who genuinely wants that, with the tradeoff spelled out.
 
 ### 5. Configure SSH
 
@@ -182,10 +190,33 @@ KbdInteractiveAuthentication yes
 AuthenticationMethods publickey,keyboard-interactive:pam
 ```
 
-### 6. Test (Keep Your Current Session Open!)
+### 6. Verify Before Touching a Real SSH Session
 
 ```bash
-# In a NEW terminal, try connecting
+# Syntax check (does NOT confirm the settings actually took effect --
+# a Match block elsewhere in the file can silently override them)
+sudo sshd -t
+
+# Effective (resolved) configuration -- confirm these three lines
+# actually appear
+sudo sshd -T | grep -iE '^(usepam|kbdinteractiveauthentication|authenticationmethods)'
+
+# Drive the PAM module directly, without SSH in the loop at all. You
+# should be prompted ONLY for the 2FA code/link, never a Unix password.
+sudo apt install pamtester
+sudo pamtester sshd youruser authenticate
+
+# If any of your accounts are password-locked (SSH-key-only), confirm
+# 2FA still works for one specifically -- this is the scenario that
+# breaks silently if common-auth ever ends up back in the stack:
+sudo passwd -S youruser   # should show L (locked) if intentionally key-only
+sudo pamtester sshd youruser authenticate
+```
+
+### 7. Test with a Second SSH Session (Keep Your Current One Open!)
+
+```bash
+# In a NEW terminal -- do not close your current session
 ssh user@your-server
 
 # You should:
@@ -194,13 +225,23 @@ ssh user@your-server
 # 3. Be prompted to enter the code
 ```
 
-### 7. Restart SSH
+If anything goes wrong, your original session is still open. Fix the issue there before trying again.
+
+### 8. Restart SSH
 
 Only after testing works:
 
 ```bash
 sudo systemctl restart sshd
 ```
+
+### 9. Have a Recovery Plan Ready
+
+Before step 8, make sure you have a way back in if something still goes wrong: console/IPMI/serial access, your cloud provider's web-based console, or a way to boot into rescue mode. If you do get locked out:
+1. Use console access to log in without SSH
+2. Revert `/etc/pam.d/sshd` (restore `@include common-auth`, remove the module line) and `/etc/ssh/sshd_config`
+3. `sudo systemctl restart sshd`
+4. Debug from there -- `journalctl -u sshd -f` while attempting a connection is the fastest way to see exactly where it's failing
 
 ## Setting Up Link-Based Authentication
 
@@ -603,10 +644,16 @@ sudo pamtester sshd yourusername authenticate
 - Either create `/etc/pam-ssh-2fa/users/<username>.conf`
 - Or set `allow_unconfigured_users = true` (less secure)
 
+**Asked for a Unix password before (or instead of) the 2FA code, or a password-locked/SSH-key-only account can't log in at all:**
+- `/etc/pam.d/sshd` almost certainly still has `@include common-auth` ahead of the 2FA module line
+- It should be *replaced*, not preceded -- see [examples/pam.d-sshd.example](examples/pam.d-sshd.example) and step 4 of Quick Start
+- Verify with `sudo pamtester sshd youruser authenticate` -- you should only ever be prompted for the 2FA code/link
+
 **Locked out:**
 - Use console/IPMI/serial access
-- Edit `/etc/pam.d/sshd` to remove the PAM line
+- Restore `/etc/pam.d/sshd` (put `@include common-auth` back, remove the module line) and revert `/etc/ssh/sshd_config`
 - Restart SSH
+- `journalctl -u sshd -f` while attempting a connection shows exactly where auth is failing
 
 ### View Logs
 
@@ -685,7 +732,7 @@ sudo ./install.sh --uninstall
 This stops and disables the approval server (if it was installed) and removes exactly the files recorded in the installation manifest -- `--dry-run` works here too, to preview what would be removed. You'll be asked whether to also delete `config.ini` and per-user configs; `--yes` always preserves them (rerun interactively to remove).
 
 Then manually:
-1. Remove the PAM line from `/etc/pam.d/sshd`
+1. In `/etc/pam.d/sshd`, remove the `pam_python.so` line and restore `@include common-auth`
 2. Revert `/etc/ssh/sshd_config` changes
 3. Restart SSH: `sudo systemctl restart sshd`
 

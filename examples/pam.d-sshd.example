@@ -4,64 +4,116 @@
 #
 # This file shows what changes to make to /etc/pam.d/sshd to enable 2FA.
 # DO NOT replace your entire sshd PAM config with this file!
-# Instead, add the relevant line to your existing config.
+# Instead, apply the specific change shown in OPTION 1 below to your
+# existing config's "auth" section.
+#
+# VALIDATED FINDING (see MODERNIZATION_PLAN.md, "the documented PAM stack
+# may not match the promised flow"): earlier versions of this example
+# said to add the 2FA module AFTER "@include common-auth". That was
+# tested empirically with pamtester against a real PAM stack and found
+# to be wrong in a way that matters:
+#
+#   - common-auth's pam_unix.so prompts for and validates a Unix
+#     password BEFORE the 2FA module ever runs, so the actual flow
+#     becomes "SSH key + Unix password + push code", not the documented
+#     "SSH key + push code".
+#   - If that password is wrong, pam_unix's fallback
+#     (auth requisite pam_deny.so) aborts the ENTIRE stack immediately --
+#     the 2FA module never even executes.
+#   - For a password-locked account (passwd -l, or any account
+#     provisioned SSH-key-only, which is this module's primary target
+#     audience), pam_unix ALWAYS fails, so login is completely
+#     impossible. 2FA can never be reached at all.
+#
+# The fix: the 2FA module should REPLACE "@include common-auth" in the
+# auth stack, not follow it. SSH key verification already happened at
+# the OpenSSH layer before this PAM stack is ever invoked (this stack
+# only runs for the keyboard-interactive step tagged ":pam" in
+# AuthenticationMethods) -- there is nothing for pam_unix to usefully
+# re-check here, and including it only adds a hidden, sometimes-fatal
+# extra factor.
 #
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# OPTION 1: Add 2FA after password authentication
+# OPTION 1 (RECOMMENDED): Replace common-auth with the 2FA module
 # -----------------------------------------------------------------------------
-# 
-# This requires: SSH key + 2FA code
-# The user authenticates with their SSH key first, then enters the 2FA code.
 #
-# Add this line AFTER "@include common-auth" in /etc/pam.d/sshd:
+# This requires: SSH key + 2FA code -- and works regardless of whether
+# the account has a Unix password set at all.
 #
-#   auth required pam_python.so /etc/pam-ssh-2fa/pam_ssh_2fa.py
+# In /etc/pam.d/sshd, REPLACE this line:
 #
-# Your /etc/pam.d/sshd should look something like:
-#
-#   # PAM configuration for the Secure Shell service
 #   @include common-auth
-#   auth required pam_python.so /etc/pam-ssh-2fa/pam_ssh_2fa.py
-#   ... (rest of file)
 #
+# with:
+#
+#   auth required pam_python.so /etc/pam-ssh-2fa/pam_ssh_2fa.py
+#
+# Leave every other line in the file (account, session, password
+# sections) exactly as it is -- those apply to all logins regardless of
+# which auth method was used and are unrelated to this change.
 
 # -----------------------------------------------------------------------------
-# OPTION 2: Make 2FA optional (soft fail)
+# OPTION 2: Also require a Unix password (three factors)
+# -----------------------------------------------------------------------------
+#
+# If you specifically want SSH key + Unix password + push code, keep
+# common-auth and add the module after it:
+#
+#   @include common-auth
+#   auth required pam_python.so /etc/pam-ssh-2fa/pam_ssh_2fa.py
+#
+# WARNING: this makes login impossible for any account without a valid,
+# unlocked Unix password (passwd -l, or a fresh SSH-key-only account
+# never given one). Confirm every account that needs to log in actually
+# has a working password before using this option, or they will be
+# locked out with no indication that 2FA was ever reached.
+
+# -----------------------------------------------------------------------------
+# OPTION 3: Make 2FA optional (soft fail)
 # -----------------------------------------------------------------------------
 #
 # If 2FA fails (e.g., notification service down), allow login anyway.
-# Less secure but prevents lockouts.
+# Less secure but prevents lockouts. Still replaces common-auth per
+# OPTION 1 -- only the control flag changes.
 #
 #   auth optional pam_python.so /etc/pam-ssh-2fa/pam_ssh_2fa.py
 #
 
 # -----------------------------------------------------------------------------
-# OPTION 3: 2FA only for certain users (via PAM succeed_if)
+# OPTION 4: 2FA only for certain users (via PAM succeed_if)
 # -----------------------------------------------------------------------------
 #
-# Only require 2FA for users in the "require2fa" group:
+# Only require 2FA for users in the "require2fa" group; everyone else
+# authenticates with just their SSH key. Also replaces common-auth.
 #
 #   auth [success=1 default=ignore] pam_succeed_if.so user notingroup require2fa
 #   auth required pam_python.so /etc/pam-ssh-2fa/pam_ssh_2fa.py
 #
+# Note: this module's own [bypass] users/networks config.ini setting
+# (see README.md) is usually a simpler way to exempt specific
+# users/networks, and doesn't require editing PAM at all.
 
 # -----------------------------------------------------------------------------
 # COMPLETE EXAMPLE /etc/pam.d/sshd
 # -----------------------------------------------------------------------------
 #
-# This is what a typical Debian/Ubuntu sshd PAM config looks like with 2FA added:
+# This is what a Debian/Ubuntu sshd PAM config looks like with OPTION 1
+# applied. The account/session/password sections below are exactly what
+# ships in Debian's default /etc/pam.d/sshd -- verified against a real
+# Debian 13 install while validating this file. Minor wording in these
+# sections has drifted slightly release to release; leave YOUR existing
+# file's account/session/password lines untouched and only change the
+# auth line as shown.
 #
 # --- BEGIN EXAMPLE ---
 
 # PAM configuration for the Secure Shell service
 
-# Standard Un*x authentication.
-@include common-auth
-
 # === PAM SSH 2FA ===
-# Require 2FA code after key/password authentication
+# Push/OTP verification. Deliberately NOT preceded by @include
+# common-auth -- see the header of this file for why.
 auth required pam_python.so /etc/pam-ssh-2fa/pam_ssh_2fa.py
 # === END PAM SSH 2FA ===
 
@@ -106,7 +158,7 @@ session    required     pam_limits.so
 session    required     pam_env.so # [1]
 # In Debian 4.0 (etch), locale-related environment variables were moved to
 # /etc/default/locale, so read that as well.
-session    required     pam_env.so user_readenv=1 envfile=/etc/default/locale
+session    required     pam_env.so envfile=/etc/default/locale
 
 # SELinux needs to intervene at login time to ensure that the process starts
 # in the proper default security context.  Only sessions which are intended
@@ -117,3 +169,26 @@ session [success=ok ignore=ignore module_unknown=ignore default=bad]        pam_
 @include common-password
 
 # --- END EXAMPLE ---
+
+# -----------------------------------------------------------------------------
+# VERIFYING THIS ACTUALLY WORKS
+# -----------------------------------------------------------------------------
+#
+# A PAM stack that parses fine (sshd -t passes) can still be semantically
+# wrong -- there is no static check for "does this actually prompt for
+# 2FA and nothing else." Before trusting this in production:
+#
+#   sudo apt install pamtester
+#   sudo pamtester sshd <youruser> authenticate
+#
+# You should be prompted ONLY for the 2FA code/link -- never for a Unix
+# password (unless you deliberately chose OPTION 2). If pamtester prompts
+# for a password first, common-auth is still in the stack somewhere.
+#
+# Also test a password-locked account specifically if any of your users
+# are SSH-key-only:
+#   sudo passwd -l <youruser>   # if not already locked
+#   sudo pamtester sshd <youruser> authenticate
+# This should still work. If it fails immediately with no 2FA prompt at
+# all, common-auth (or another module that requires a working password)
+# is still ahead of the 2FA module in the stack.

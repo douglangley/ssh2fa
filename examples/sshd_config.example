@@ -102,15 +102,37 @@ UseDNS no
 #
 # 1. Check config syntax:
 #    sudo sshd -t
+#    This only validates syntax. It will happily pass even if
+#    KbdInteractiveAuthentication is still "no" or AuthenticationMethods
+#    is still "any" from a Match block or a value set elsewhere -- syntax
+#    errors are not the same as "this config does what I intend."
 #
-# 2. Test in debug mode (in a separate window):
+# 2. Check the EFFECTIVE (resolved) configuration:
+#    sudo sshd -T | grep -iE '^(usepam|kbdinteractiveauthentication|authenticationmethods|passwordauthentication)'
+#    Confirm you actually see:
+#      usepam yes
+#      kbdinteractiveauthentication yes
+#      authenticationmethods publickey,keyboard-interactive:pam
+#    If any of these differ from what you just set, something else in
+#    the file (or a Match block below your edit) is overriding it --
+#    `sshd -t` alone would NOT have caught this.
+#
+# 3. Also confirm the paired /etc/pam.d/sshd change is correct -- see
+#    ../examples/pam.d-sshd.example. The most common mistake is adding
+#    the 2FA module AFTER "@include common-auth" instead of in place of
+#    it: that silently adds a Unix password requirement before 2FA is
+#    even attempted, and makes login completely impossible for
+#    password-locked (SSH-key-only) accounts. This was verified with
+#    pamtester, not assumed -- see MODERNIZATION_PLAN.md.
+#
+# 4. Test in debug mode (in a separate window):
 #    sudo /usr/sbin/sshd -d -p 2222
 #    Then connect: ssh -p 2222 user@localhost
 #
-# 3. Keep your current SSH session open!
+# 5. Keep your current SSH session open!
 #    Never close your session until you've verified you can connect.
 #
-# 4. Restart SSH:
+# 6. Restart SSH:
 #    sudo systemctl restart sshd
 #
 
@@ -134,4 +156,11 @@ UseDNS no
 # - Your SSH key isn't being accepted
 # - Check ~/.ssh/authorized_keys permissions
 # - Ensure PubkeyAuthentication yes (usually default)
+#
+# If you're asked for a Unix PASSWORD before (or instead of) the 2FA
+# code, or if a password-locked/SSH-key-only account can't log in at
+# all:
+# - /etc/pam.d/sshd almost certainly still has "@include common-auth"
+#   ahead of the 2FA module line. See ../examples/pam.d-sshd.example --
+#   the module should REPLACE common-auth for this stack, not follow it.
 #

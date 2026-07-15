@@ -514,6 +514,19 @@ verify_installation() {
             sed 's/^/    /' "$sshd_check_err" >&2
         fi
         rm -f "$sshd_check_err"
+
+        # sshd -t only checks syntax; it says nothing about whether
+        # keyboard-interactive PAM auth is actually reachable. sshd -T
+        # reports the EFFECTIVE (resolved) config, which is what
+        # actually matters -- a Match block or a later line can silently
+        # override a setting you think you already made. This is
+        # informational (these are the settings BEFORE any manual
+        # sshd_config edit you make later, per step 5 of the next-steps
+        # instructions) and never fails the install.
+        info "Current effective sshd settings relevant to 2FA (sshd -T):"
+        sshd -T 2>/dev/null \
+            | grep -iE '^(usepam|kbdinteractiveauthentication|authenticationmethods|passwordauthentication)' \
+            | sed 's/^/    /'
     fi
 
     return $errors
@@ -572,10 +585,19 @@ show_instructions() {
     echo "3. Test notifications:"
     echo "   python3 ${INSTALL_DIR}/${MODULE_FILE} --test-notify"
     echo ""
-    echo "4. Configure PAM (add to /etc/pam.d/sshd):"
+    echo "4. Configure PAM (edit /etc/pam.d/sshd):"
     echo ""
-    echo "   After '@include common-auth' or similar, add:"
-    echo "   auth required pam_python.so ${INSTALL_DIR}/${MODULE_FILE}"
+    echo "   REPLACE this line:"
+    echo "     @include common-auth"
+    echo "   with:"
+    echo "     auth required pam_python.so ${INSTALL_DIR}/${MODULE_FILE}"
+    echo ""
+    echo "   IMPORTANT: adding the module AFTER common-auth (instead of"
+    echo "   replacing it) silently requires a valid Unix password before"
+    echo "   2FA is even attempted, and makes login completely impossible"
+    echo "   for password-locked (SSH-key-only) accounts. See"
+    echo "   examples/pam.d-sshd.example for the validated explanation and"
+    echo "   alternatives (e.g. requiring a password AND 2FA on purpose)."
     echo ""
     echo "5. Configure SSH (/etc/ssh/sshd_config):"
     echo ""
@@ -584,11 +606,29 @@ show_instructions() {
     echo "   KbdInteractiveAuthentication yes"
     echo "   AuthenticationMethods publickey,keyboard-interactive:pam"
     echo ""
-    echo "6. Test with a SEPARATE SSH session before logging out!"
+    echo "   Then verify with sshd -T, not just sshd -t: sshd -t only"
+    echo "   checks syntax and will pass even if a Match block or another"
+    echo "   line overrides these settings elsewhere in the file."
+    echo "     sshd -t"
+    echo "     sshd -T | grep -iE '^(usepam|kbdinteractiveauthentication|authenticationmethods)'"
+    echo "   Confirm the output actually shows the three values above."
+    echo ""
+    echo "6. Verify the PAM change alone, before touching SSH at all:"
+    echo "     sudo apt install pamtester"
+    echo "     sudo pamtester sshd <youruser> authenticate"
+    echo "   You should be prompted ONLY for the 2FA code/link, never a"
+    echo "   Unix password. If a user account is password-locked, confirm"
+    echo "   this still works for them specifically."
+    echo ""
+    echo "7. Test with a SEPARATE SSH session before logging out!"
     echo "   Always keep your current session open as backup."
     echo ""
-    echo "7. Restart SSH when ready:"
+    echo "8. Restart SSH when ready:"
     echo "   systemctl restart sshd"
+    echo ""
+    echo "9. Have a recovery plan ready BEFORE step 8: console/IPMI/serial"
+    echo "   access, or a way to boot into rescue mode, in case something"
+    echo "   still locks you out despite the checks above."
     echo ""
     echo "Every file this script created is recorded in:"
     echo "   ${MANIFEST_FILE}"
@@ -660,7 +700,8 @@ uninstall() {
     echo "Uninstall complete."
     echo ""
     echo "IMPORTANT: You must manually:"
-    echo "1. Remove the PAM line from /etc/pam.d/sshd"
+    echo "1. In /etc/pam.d/sshd, remove the pam_python.so line and restore"
+    echo "   '@include common-auth'"
     echo "2. Revert changes to /etc/ssh/sshd_config"
     echo "3. Restart SSH: systemctl restart sshd"
     echo "============================================================================="

@@ -1947,10 +1947,11 @@ def pam_sm_authenticate(pamh, flags, argv):
         argv: Module arguments from PAM config (not used)
 
     Returns:
-        PAM_SUCCESS: Authentication successful
+        PAM_SUCCESS: Authentication successful, or 2FA bypassed
+            (user/network in bypass list, or user unconfigured with
+            allow_unconfigured_users=true)
         PAM_AUTH_ERR: Authentication failed
         PAM_AUTHINFO_UNAVAIL: Could not send notification
-        PAM_IGNORE: 2FA bypassed (user/network in bypass list)
         PAM_MAXTRIES: Rate limit exceeded (per-user, per-source, or too
             many concurrent pending requests)
     """
@@ -1999,7 +2000,19 @@ def pam_sm_authenticate(pamh, flags, argv):
     )
 
     if bypass_checker.should_bypass(user, rhost):
-        return PAM_IGNORE  # Skip 2FA, continue to next PAM module
+        # PAM_SUCCESS, not PAM_IGNORE. PAM_IGNORE tells the framework to
+        # disregard this module's result and let some OTHER module in the
+        # stack decide success/failure -- but the documented/recommended
+        # PAM stack for this module (see examples/pam.d-sshd.example)
+        # contains no other auth module, since SSH key verification
+        # already happened at the OpenSSH layer before this stack ever
+        # runs. With no other module to fall back on, PAM_IGNORE resolves
+        # to an overall DENY, not a pass-through -- confirmed with
+        # pamtester: a bypassed user got "Permission denied" here even
+        # though should_bypass() correctly logged the bypass. PAM_SUCCESS
+        # unambiguously grants access regardless of what else is (or
+        # isn't) in the stack.
+        return PAM_SUCCESS
 
     # -------------------------------------------------------------------------
     # Step 3.5: Load user-specific configuration
