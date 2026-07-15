@@ -1,6 +1,12 @@
 # PAM SSH 2FA Audit, Remediation, and User Administration Plan
 
-Status: proposed after a full repository audit on 2026-07-14
+Status: proposed after a full repository audit on 2026-07-14; Phase 0 and
+Phase 1 of the "Implementation sequence" below (request-state atomicity,
+configuration, and secret/logging handling) landed the same day. See the
+`[FIXED]`/`[PARTIAL]` tags on individual findings below for exactly what
+changed and what's still open. Phases 2-6 (installer/PAM-SSH
+verification, native providers, admin CLI, unprivileged daemon,
+packaging) have not started.
 
 This is the implementation plan for the next work. It supersedes the
 "Phase 1 is essentially complete" conclusion in `MODERNIZATION_PLAN.md`.
@@ -141,7 +147,16 @@ Severity means:
 - P2: maintainability, operational, or documentation work that may follow P1
   but must be tracked.
 
-### P0-1: OTP validation is not atomic or single-use under concurrency
+### P0-1: OTP validation is not atomic or single-use under concurrency [FIXED]
+
+Fixed: `CodeManager.validate()` now opens the code file once and holds an
+exclusive `flock()` across the whole read/check/attempt-update/delete
+transition, with an inode-staleness check (`os.fstat` vs `os.stat`) so a
+racing caller can detect that its open file was since consumed/replaced
+instead of trusting stale data. See `CodeManager._validate_locked()` and
+`test_atomicity_regressions.py::CodeManagerAtomicityTests`, which
+reproduced the double-validation and state-resurrection races against the
+pre-fix code and now pass deterministically (run 5x with no flakiness).
 
 Current state:
 
@@ -177,7 +192,15 @@ Acceptance tests:
 - Success, expiration, cancellation, notification failure, and unexpected
   exceptions leave no reusable OTP state.
 
-### P0-2: the concurrent-request cap is a check-then-create race
+### P0-2: the concurrent-request cap is a check-then-create race [FIXED]
+
+Fixed: added `RateLimiter.reserve_request()`/`release_request()`, an
+atomic prune-count-reserve operation under one per-user `flock()`ed
+lease-list file, replacing the old scan-then-create pattern in
+`pam_sm_authenticate()`. One lease now covers one authentication attempt
+regardless of `auth_method`, so `both` is counted once instead of twice.
+See `test_atomicity_regressions.py::RateLimiterReservationTests`
+(20-thread barrier test against a cap of 3 admits exactly 3).
 
 Current state:
 
@@ -210,7 +233,19 @@ Acceptance tests:
 - Crashed/abandoned requests stop counting after expiration.
 - Cleanup and reservation racing cannot delete or exceed live leases.
 
-### P0-3: authentication state is leaked on many terminal paths
+### P0-3: authentication state is leaked on many terminal paths [FIXED]
+
+Fixed: Steps 5-7 of `pam_sm_authenticate()` were extracted into
+`_run_challenge()`, called from one outer `try/finally` in
+`pam_sm_authenticate()` that always releases the P0-2 lease and calls
+`_best_effort_cleanup()` -- which removes any OTP/approval state
+`_run_challenge()` created, regardless of whether it returned normally,
+returned early, or raised. This is a safety net on top of (not a
+replacement for) the existing per-branch cleanup calls. See
+`test_atomicity_regressions.py::RequestStateCleanupTests`, which
+reproduces the audit's own example (a notification-delivery failure in
+`both` mode previously left the OTP file behind because only the
+approval file was cleaned up) and confirms both are now gone.
 
 Current examples include:
 
@@ -235,7 +270,16 @@ Required fix:
 - Explicitly record the terminal state for observability, then remove secrets.
 - Add a fault-injection test at every construction and authentication step.
 
-### P0-4: valid percent-encoded notification URLs can crash configuration loading
+### P0-4: valid percent-encoded notification URLs can crash configuration loading [FIXED]
+
+Fixed: `pam_ssh_2fa.Config`, `approval_server.ServerConfig`, and
+`notify_check.py` now all construct `configparser.ConfigParser` with
+`interpolation=None`. See
+`test_atomicity_regressions.py::ConfigInterpolationTests`.
+
+Not done in this pass: the broader per-setting bounds/type validation
+and a real `config check` command described in the rest of this
+finding remain open.
 
 All three parsers use `configparser.ConfigParser()` with interpolation enabled.
 An ordinary encoded URL such as one containing `%40` raises
@@ -255,7 +299,19 @@ Required fix:
 - Bound `timeout`, `max_attempts`, `server.port`, and message/template sizes;
   they are documented as bounded but several are parsed with bare `int`.
 
-### P0-5: bearer tokens and provider secrets can be logged or printed
+### P0-5: bearer tokens and provider secrets can be logged or printed [PARTIAL]
+
+Fixed: `ApprovalRequestHandler.log_message()` no longer logs `args[0]`
+(the raw request line, which contained `/approve/<bearer-token>`); it
+logs only the method and a redacted route. `notify_check.py`'s
+`_redact_url()` now shows only the URL scheme instead of a
+split-on-'@' heuristic that printed the Pushover application token in
+full. See `test_atomicity_regressions.py::ApprovalServerLoggingTests`.
+
+Not done in this pass: there is no general allowlist-based redaction
+helper used across all logs/CLI/exceptions, and provider-aware display
+formatting (`pushover(user=****abcd)` etc.) does not exist yet -- both
+depend on the native-provider work in Phase 3, which hasn't started.
 
 Current state:
 
@@ -362,7 +418,16 @@ Required fix:
 Linux-PAM control semantics reference:
 <https://man7.org/linux/man-pages/man5/pam.d.5.html>
 
-### P1-1: approval state is marked atomically on disk but not consumed atomically
+### P1-1: approval state is marked atomically on disk but not consumed atomically [FIXED]
+
+Fixed: added `ApprovalManager.consume_approval()` in pam_ssh_2fa.py,
+using the same `flock()` + inode-staleness technique as P0-1's
+`CodeManager._validate_locked()` to check-and-delete an approved request
+in one locked operation. All four grant sites in `_run_challenge()`
+(link-only poll loop, and the three grant checks in `both` mode) now call
+`consume_approval()` instead of a separate `is_approved()` +
+`cleanup()` pair. See
+`test_atomicity_regressions.py::ApprovalConsumptionAtomicityTests`.
 
 `os.replace()` prevents partial JSON, but it does not make the logical
 read/check/write transition atomic. `is_approved()` can return true repeatedly
@@ -491,7 +556,20 @@ Required fix:
 8. Resolve global and per-user policy into one immutable validated snapshot per
    authentication request; do not reread the global file mid-decision.
 
-### P1-6: URL and state schemas need strict validation
+### P1-6: URL and state schemas need strict validation [PARTIAL]
+
+Fixed: OTP and approval JSON state is now validated before use --
+non-dict payloads and non-numeric `expires`/`attempts` fields fail
+closed instead of raising inside `validate()`/`consume_approval()` (see
+`test_atomicity_regressions.py`'s `test_non_dict_json_state_...` and
+`test_non_numeric_expires_field_...` tests). In-process poll-loop
+deadlines (`ApprovalManager.wait_for_approval()` and the link-only loop
+in `_run_challenge()`) now use `time.monotonic()` instead of
+`time.time()`, so a wall-clock adjustment mid-wait can't affect them.
+
+Not done in this pass: approval-URL scheme/host/port/userinfo
+validation, `O_EXCL` for approval file creation, and symlink/ownership
+checks on state directories all remain open.
 
 Required additions:
 
@@ -531,7 +609,18 @@ Required fix:
 - Add fault-injection tests for mkdir/open/read/write/fsync/replace/unlink,
   malformed configuration, provider timeout, and PAM conversation exceptions.
 
-### P1-8: logging resources and log-file permissions are unsafe
+### P1-8: logging resources and log-file permissions are unsafe [PARTIAL]
+
+Fixed: `PAMLogger` now closes each prior handler before clearing them
+(instead of just dropping the reference), sets `propagate=False`, and
+exposes an idempotent `close()`. The `ResourceWarning`s the audit
+observed for unclosed file/syslog handlers are gone: the full suite now
+runs clean under `python3 -W error::ResourceWarning -m unittest
+discover`.
+
+Not done in this pass: log rotation, pre-created private-mode log files
+(vs. relying on umask), and control-character escaping in
+user/rhost/context values all remain open.
 
 `PAMLogger` clears handlers without closing them, producing the observed file
 and syslog `ResourceWarning`s and potentially leaking descriptors in a
@@ -887,39 +976,66 @@ token, and never listen on a public interface.
 
 ## Implementation sequence
 
-### Phase 0: correct claims and add failing regression tests
+### Phase 0: correct claims and add failing regression tests [DONE]
 
 Goal: make the repository accurately describe its current safety level.
 
-- Reopen the relevant modernization findings.
+- Reopen the relevant modernization findings. -- done in this document and
+  `MODERNIZATION_PLAN.md`'s status table.
 - Add deterministic failing tests for P0-1 through P0-7 before changing code.
-- Rename the manual notification utility so it is not test-discovered.
-- Add CI jobs for Python compile/unit tests and ShellCheck/Ruff.
+  -- done for P0-1, P0-2, P0-4, P0-5 (`test_atomicity_regressions.py`,
+  written against and confirmed failing on commit `c04f8a7`). P0-6
+  (installer restore) and P0-7 (PAM/SSH alternatives) are Phase 2 work
+  per this document's own phasing and do not yet have tests.
+- Rename the manual notification utility so it is not test-discovered. --
+  done (`test_notify.py` -> `notify_check.py`).
+- Add CI jobs for Python compile/unit tests and ShellCheck/Ruff. -- done
+  (`.github/workflows/ci.yml`); also ran `ruff check --fix` once over the
+  existing codebase (unused imports, a bare `except`, extraneous
+  f-strings -- all pre-existing, none security-relevant).
 
-Exit criteria:
+Exit criteria: met for the P0-1/P0-2/P0-4/P0-5 scope above. P0-6/P0-7
+remain reopened findings without regression tests yet -- see Phase 2.
 
-- Each reopened claim has a test that fails on the audited revision.
-- User-facing docs no longer recommend unvalidated PAM alternatives or exact
-  installer restoration.
-
-### Phase 1: repair request state, configuration, and secret handling
+### Phase 1: repair request state, configuration, and secret handling [DONE for P0-1/P0-2/P0-3/P0-4/P0-5/P1-1; PARTIAL for P1-6/P1-8]
 
 Goal: establish a trustworthy Python reference implementation.
 
 - Implement one atomic request lease and one outer lifecycle cleanup boundary.
-- Make OTP and approval transitions single-consumer.
-- Disable INI interpolation and validate the complete typed schema.
-- Fix log/CLI secret redaction and handler lifecycle.
-- Validate URL/state schemas and use monotonic wait deadlines.
+  -- done: `RateLimiter.reserve_request()`/`release_request()` (P0-2),
+  `_run_challenge()` + `_best_effort_cleanup()` (P0-3).
+- Make OTP and approval transitions single-consumer. -- done:
+  `CodeManager._validate_locked()` (P0-1), `ApprovalManager.consume_approval()`
+  (P1-1).
+- Disable INI interpolation and validate the complete typed schema. --
+  interpolation disabled everywhere (P0-4); typed *schema* validation is
+  still only the OTP/approval JSON state (P1-6), not the full config
+  schema described elsewhere in this document.
+- Fix log/CLI secret redaction and handler lifecycle. -- bearer-token
+  logging leak fixed (P0-5); handler lifecycle fixed (P1-8). The general
+  allowlist-based redaction helper and provider-aware display formatting
+  are not built (they depend on Phase 3's native providers).
+- Validate URL/state schemas and use monotonic wait deadlines. -- done
+  for JSON state type-checks and poll-loop monotonic deadlines (P1-6);
+  approval-URL scheme/host/port validation and symlink/ownership checks
+  remain open.
 
 Exit criteria:
 
-- Atomicity probes yield one consumer and never exceed a cap.
-- Fault injection leaves no credential/request state.
-- Encoded URLs parse correctly.
-- Secret-canary tests find no disclosure.
+- Atomicity probes yield one consumer and never exceed a cap. -- met, see
+  `CodeManagerAtomicityTests`, `RateLimiterReservationTests`,
+  `ApprovalConsumptionAtomicityTests`.
+- Fault injection leaves no credential/request state. -- met for the
+  notification-failure case the audit specifically called out
+  (`RequestStateCleanupTests`); not exhaustively fuzzed across every
+  construction/exception point.
+- Encoded URLs parse correctly. -- met, see `ConfigInterpolationTests`.
+- Secret-canary tests find no disclosure. -- met for the specific P0-5
+  leak (approval bearer token in debug HTTP logs, Pushover app token in
+  `notify_check.py`); not a general-purpose secret-canary sweep.
 - The existing 52 tests plus new regression tests pass without resource
-  warnings.
+  warnings. -- met: 63 tests total, `python3 -W error::ResourceWarning -m
+  unittest discover` is clean.
 
 ### Phase 2: repair installer and PAM/SSH verification
 

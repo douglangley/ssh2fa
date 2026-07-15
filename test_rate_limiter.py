@@ -5,7 +5,6 @@ import json
 import os
 import tempfile
 import threading
-import time
 import unittest
 
 from pam_ssh_2fa import RateLimiter

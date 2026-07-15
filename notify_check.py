@@ -7,27 +7,31 @@ This utility allows you to test notification delivery without going through
 the full PAM authentication flow. Use it to verify your Apprise URLs are
 correct before enabling the PAM module.
 
+This is a manual diagnostic tool, not part of the automated test suite --
+it is deliberately named so it is NOT picked up by `unittest discover -p
+"test_*.py"` (see AUDIT_REMEDIATION_AND_ADMIN_PLAN.md P2-2).
+
 USAGE:
-    ./test_notify.py                    # Use global config URLs
-    ./test_notify.py --user doug        # Test doug's personal config
-    ./test_notify.py --url "ntfy://..." # Test a specific URL
-    ./test_notify.py --list-services    # Show supported services
+    ./notify_check.py                    # Use global config URLs
+    ./notify_check.py --user doug        # Test doug's personal config
+    ./notify_check.py --url "ntfy://..." # Test a specific URL
+    ./notify_check.py --list-services    # Show supported services
 
 EXAMPLES:
     # Test with your configured URLs
-    sudo ./test_notify.py
+    sudo ./notify_check.py
 
     # Test a specific user's configuration
-    sudo ./test_notify.py --user doug
+    sudo ./notify_check.py --user doug
 
     # Test a specific ntfy topic
-    ./test_notify.py --url "ntfy://ntfy.sh/my-topic"
+    ./notify_check.py --url "ntfy://ntfy.sh/my-topic"
 
     # Test Pushover
-    ./test_notify.py --url "pover://USERKEY@APPTOKEN"
+    ./notify_check.py --url "pover://USERKEY@APPTOKEN"
 
     # Test multiple URLs
-    ./test_notify.py --url "ntfy://ntfy.sh/topic1" --url "pover://user@token"
+    ./notify_check.py --url "ntfy://ntfy.sh/topic1" --url "pover://user@token"
 """
 
 import argparse
@@ -104,7 +108,7 @@ def load_config_urls(config_path="/etc/pam-ssh-2fa/config.ini", user=None):
 
     # Load global config
     if os.path.exists(config_path):
-        parser = configparser.ConfigParser()
+        parser = configparser.ConfigParser(interpolation=None)
         try:
             parser.read(config_path)
             urls_str = parser.get("notifications", "apprise_urls", fallback="")
@@ -129,7 +133,7 @@ def load_config_urls(config_path="/etc/pam-ssh-2fa/config.ini", user=None):
         for ext in [".conf", ".ini", ""]:
             user_config_file = os.path.join(user_config_dir, f"{user}{ext}")
             if os.path.exists(user_config_file):
-                parser = configparser.ConfigParser()
+                parser = configparser.ConfigParser(interpolation=None)
                 try:
                     parser.read(user_config_file)
                     urls_str = parser.get("notifications", "apprise_urls", fallback="")
@@ -148,6 +152,29 @@ def load_config_urls(config_path="/etc/pam-ssh-2fa/config.ini", user=None):
                 )
 
     return urls, source
+
+
+def _redact_url(url: str) -> str:
+    """
+    Redact a notification URL for display, keeping only the scheme.
+
+    A previous version masked only the part of the URL before '@' and
+    printed everything after it verbatim. That is backwards for schemes
+    like Pushover's `pover://USER_KEY@APP_TOKEN`, where the secret
+    (the application token) is the part AFTER '@' -- it was being
+    printed in full. Different providers put their secret on different
+    sides of '@' (or in the query string, as ntfy access tokens can
+    be), so no single split-on-'@' rule is safe for every scheme. Show
+    only the scheme and redact everything else.
+
+    Args:
+        url: A notification URL that may contain credentials
+
+    Returns:
+        A display-safe string with only the scheme preserved
+    """
+    scheme = url.split("://", 1)[0] if "://" in url else url
+    return f"{scheme}://***REDACTED***"
 
 
 def send_test_notification(urls, code="1234"):
@@ -174,7 +201,7 @@ def send_test_notification(urls, code="1234"):
     # Get hostname
     try:
         hostname = os.uname().nodename
-    except:
+    except OSError:
         hostname = "test-host"
 
     # Create notification content
@@ -197,16 +224,7 @@ This code would expire in 5 minutes during real authentication."""
     print()
 
     for url in urls:
-        # Mask sensitive parts of URL for display
-        display_url = url
-        if "@" in url:
-            # Hide credentials
-            parts = url.split("@")
-            if len(parts) >= 2:
-                prefix = parts[0].split("://")[0] if "://" in parts[0] else parts[0]
-                display_url = f"{prefix}://***@{parts[-1]}"
-
-        print(f"  Adding: {display_url}")
+        print(f"  Adding: {_redact_url(url)}")
         apobj.add(url)
 
     print()
@@ -300,7 +318,7 @@ Examples:
     source = "command line"
 
     if not urls:
-        print(f"Loading URLs from config...")
+        print("Loading URLs from config...")
         if args.user:
             print(f"Looking for user-specific config for: {args.user}")
         urls, source = load_config_urls(args.config, args.user)

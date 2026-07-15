@@ -3,7 +3,6 @@
 
 import tempfile
 import unittest
-from configparser import ConfigParser
 
 from pam_ssh_2fa import CODE_LENGTH_MAX, CODE_LENGTH_MIN, Config, DEFAULTS
 

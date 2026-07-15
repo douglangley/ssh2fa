@@ -616,7 +616,7 @@ sudo pamtester sshd yourusername authenticate
 **No notification received:**
 - Check your Apprise URL format
 - Run the self-test: `python3 /etc/pam-ssh-2fa/pam_ssh_2fa.py --test-notify`
-- Test specific user: `python3 /etc/pam-ssh-2fa/test_notify.py --user doug`
+- Test specific user: `python3 /etc/pam-ssh-2fa/notify_check.py --user doug`
 - Check if outbound HTTPS is allowed
 
 **SSH hangs after key auth:**
@@ -707,7 +707,7 @@ curl https://your-server:9110/health
 /etc/pam-ssh-2fa/
 |-- pam_ssh_2fa.py         # Main PAM module (Python)
 |-- approval_server.py     # Approval server, only if --enable-link-approval
-|-- test_notify.py         # Manual notification testing utility
+|-- notify_check.py         # Manual notification testing utility
 |-- cleanup_codes.py       # Cron-driven expired-code cleanup utility
 |-- config.ini             # Global configuration file
 |-- .install-manifest      # What install.sh created, for precise --uninstall

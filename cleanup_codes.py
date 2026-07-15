@@ -25,7 +25,6 @@ import sys
 import json
 import time
 import argparse
-from pathlib import Path
 
 # Default storage directory - should match config
 STORAGE_DIR = "/var/run/pam-ssh-2fa"
@@ -175,7 +174,7 @@ Examples:
             return 0
 
     if not args.quiet:
-        print(f"PAM SSH 2FA - Code Cleanup")
+        print("PAM SSH 2FA - Code Cleanup")
         print(f"Storage directory: {args.storage_dir}")
         if args.dry_run:
             print("DRY RUN - no changes will be made")

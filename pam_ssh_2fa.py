@@ -88,9 +88,7 @@ import hashlib
 import tempfile
 import fcntl
 import ipaddress
-from pathlib import Path
-from datetime import datetime, timedelta
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Any
 from urllib.parse import urlparse
 
 # Apprise is imported conditionally to provide better error messages
@@ -235,8 +233,25 @@ class PAMLogger:
         self.debug_enabled = debug
         self.logger = logging.getLogger("pam-ssh-2fa")
         self.logger.setLevel(logging.DEBUG if debug else logging.INFO)
+        # Don't propagate to the root logger -- PAM modules can be
+        # constructed repeatedly within one long-lived process (each
+        # authentication attempt makes a fresh PAMLogger), and without
+        # this every message would also be emitted by whatever handlers
+        # end up on the root logger, duplicating output.
+        self.logger.propagate = False
 
-        # Clear any existing handlers to avoid duplicates on module reload
+        # Close any existing handlers before clearing them. handlers.clear()
+        # alone drops the references without closing the underlying file/
+        # socket descriptors, which showed up as ResourceWarnings for
+        # unclosed log files and syslog sockets under repeated
+        # construction (e.g. one PAMLogger per test, or per PAM
+        # invocation in a long-lived process) -- see P1-8 in
+        # AUDIT_REMEDIATION_AND_ADMIN_PLAN.md.
+        for handler in self.logger.handlers:
+            try:
+                handler.close()
+            except Exception:
+                pass
         self.logger.handlers.clear()
 
         # Create log directory if it doesn't exist
@@ -304,6 +319,25 @@ class PAMLogger:
         """Log a DEBUG level message (only if debug mode is enabled)."""
         if self.debug_enabled:
             self.logger.debug(self._format_message(message, **kwargs))
+
+    def close(self):
+        """
+        Close and detach this logger's handlers.
+
+        Idempotent -- safe to call multiple times, and safe even if a
+        later PAMLogger construction has already replaced these handlers
+        on the shared "pam-ssh-2fa" logger (each handler is closed and
+        removed by reference, not by looking the logger up again).
+        """
+        for handler in list(self.logger.handlers):
+            try:
+                handler.close()
+            except Exception:
+                pass
+            try:
+                self.logger.removeHandler(handler)
+            except Exception:
+                pass
 
 
 # =============================================================================
@@ -428,7 +462,15 @@ class Config:
                       (notifications section). This prevents users from
                       overriding system-wide security settings.
         """
-        parser = configparser.ConfigParser()
+        # interpolation=None: a percent-encoded value (e.g. a notification
+        # URL containing "%40") is valid INI content, but configparser's
+        # default interpolation treats a bare "%" as the start of an
+        # interpolation directive and raises InterpolationSyntaxError from
+        # parser.get() -- which is not a ValueError/TypeError, so it used
+        # to escape the per-option try/except below and abort the whole
+        # PAM authentication path (see P0-4 in
+        # AUDIT_REMEDIATION_AND_ADMIN_PLAN.md).
+        parser = configparser.ConfigParser(interpolation=None)
         try:
             parser.read(filepath)
         except configparser.Error:
@@ -812,6 +854,17 @@ class CodeManager:
         On successful validation, the code file is deleted.
         On failure, the attempt counter is incremented.
 
+        The complete read/check/update/delete transition happens while
+        holding an exclusive flock() on the code file, so two concurrent
+        validate() calls for the same request ID can never both observe
+        (and act on) the same pre-transition state -- see P0-1 in
+        AUDIT_REMEDIATION_AND_ADMIN_PLAN.md, which found that the
+        previous check-then-act version let two concurrent validations
+        of one OTP both succeed. Holding the file open across the whole
+        transition also lets a losing racer detect (via an inode
+        comparison) that the file it opened was since replaced or
+        deleted by the winner, instead of trusting stale in-memory data.
+
         Args:
             user: Username
             rhost: Remote host IP address
@@ -828,22 +881,60 @@ class CodeManager:
         except ValueError:
             return False, "Invalid request. Please reconnect."
 
-        # Check if code file exists
-        if not os.path.exists(code_file):
+        try:
+            fd = os.open(code_file, os.O_RDWR)
+        except FileNotFoundError:
             if self.logger:
                 self.logger.warning(
                     "No code found for validation", user=user, rhost=rhost
                 )
             return False, "No pending code found. Please reconnect."
+        except OSError as e:
+            if self.logger:
+                self.logger.error(f"Failed to open code file: {e}")
+            return False, "Internal error. Please reconnect."
 
-        # Read and parse code data
         try:
-            with open(code_file, "r") as f:
-                code_data = json.load(f)
-        except (json.JSONDecodeError, IOError) as e:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                return self._validate_locked(fd, code_file, user, rhost, entered_code)
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def _validate_locked(
+        self, fd: int, code_file: str, user: str, rhost: str, entered_code: str
+    ) -> Tuple[bool, str]:
+        """
+        Perform the actual validation transition while fd is flock()ed.
+
+        Must only be called with fd already holding an exclusive lock on
+        code_file. Not part of the public API -- see validate().
+        """
+        # A racing call may have already consumed (unlinked) or replaced
+        # this file between our open() and acquiring the lock. Comparing
+        # the inode our fd refers to against what the path currently
+        # resolves to detects that: unlink() doesn't invalidate an
+        # already-open fd, so without this check we could still read and
+        # act on stale, already-consumed data.
+        try:
+            path_stat = os.stat(code_file)
+        except FileNotFoundError:
+            return False, "No pending code found. Please reconnect."
+        fd_stat = os.fstat(fd)
+        if (path_stat.st_ino, path_stat.st_dev) != (fd_stat.st_ino, fd_stat.st_dev):
+            return False, "No pending code found. Please reconnect."
+
+        try:
+            raw = os.read(fd, 1 << 20)
+            code_data = json.loads(raw.decode("utf-8"))
+            if not isinstance(code_data, dict):
+                raise ValueError("code state is not an object")
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as e:
             if self.logger:
                 self.logger.error(f"Failed to read code file: {e}")
-            self._cleanup_code(code_file)
+            self._unlink_locked(code_file)
             return False, "Internal error. Please reconnect."
 
         # Verify the code belongs to this user and source (defense in
@@ -858,39 +949,47 @@ class CodeManager:
                 )
             return False, "Session mismatch. Please reconnect."
 
-        # Check if code has expired
-        if time.time() > code_data.get("expires", 0):
+        expires = code_data.get("expires", 0)
+        if not isinstance(expires, (int, float)) or time.time() > expires:
             if self.logger:
                 self.logger.info("Code expired", user=user, rhost=rhost)
-            self._cleanup_code(code_file)
+            self._unlink_locked(code_file)
             return False, "Code expired. Please reconnect to receive a new code."
 
-        # Check attempt count
         attempts = code_data.get("attempts", 0)
+        if not isinstance(attempts, int):
+            attempts = 0
         if attempts >= self.max_attempts:
             if self.logger:
                 self.logger.warning(
                     "Max attempts exceeded", user=user, rhost=rhost, attempts=attempts
                 )
-            self._cleanup_code(code_file)
+            self._unlink_locked(code_file)
             return False, "Maximum attempts exceeded. Please reconnect."
 
         # Validate the code using constant-time comparison
         # This prevents timing attacks that could reveal code characters
         stored_code = code_data.get("code", "")
-        if secrets.compare_digest(entered_code.strip(), stored_code):
-            # Success! Clean up the code file
+        if isinstance(stored_code, str) and secrets.compare_digest(
+            entered_code.strip(), stored_code
+        ):
             if self.logger:
                 self.logger.info("Code validated successfully", user=user, rhost=rhost)
-            self._cleanup_code(code_file)
+            self._unlink_locked(code_file)
             return True, "Verification successful."
 
-        # Invalid code - increment attempt counter
+        # Invalid code - increment attempt counter in place, on the same
+        # fd/inode, so the lock and the staleness check above continue to
+        # apply to whoever opens this path next.
         code_data["attempts"] = attempts + 1
         remaining = self.max_attempts - code_data["attempts"]
 
         try:
-            self._write_atomic(code_file, code_data)
+            encoded = json.dumps(code_data).encode("utf-8")
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.ftruncate(fd, 0)
+            os.write(fd, encoded)
+            os.fsync(fd)
         except OSError:
             pass  # Best effort to save attempts
 
@@ -906,8 +1005,35 @@ class CodeManager:
         if remaining > 0:
             return False, f"Invalid code. {remaining} attempts remaining."
         else:
-            self._cleanup_code(code_file)
+            self._unlink_locked(code_file)
             return False, "Invalid code. Maximum attempts exceeded."
+
+    @staticmethod
+    def _unlink_locked(code_file: str):
+        """Remove a code file while its lock is still held by the caller."""
+        try:
+            os.unlink(code_file)
+        except OSError:
+            pass  # Best effort cleanup
+
+    def cancel(self, request_id: str):
+        """
+        Best-effort removal of a code file that was never consumed by
+        validate() -- e.g. the PAM conversation was cancelled, or
+        notification delivery failed after the code was already written.
+        Safe to call even if the file was already removed.
+
+        Args:
+            request_id: The request ID returned by generate()
+        """
+        try:
+            code_file = self._get_code_file(request_id)
+        except ValueError:
+            return
+        try:
+            os.unlink(code_file)
+        except OSError:
+            pass  # Best effort cleanup
 
     def _cleanup_code(self, code_file: str):
         """
@@ -1283,6 +1409,85 @@ class ApprovalManager:
         except OSError:
             pass
 
+    def consume_approval(self, token: str) -> bool:
+        """
+        Atomically check whether an approval has been granted and, if
+        so, consume it (delete the file) in one locked operation.
+
+        This is the single decision point PAM should use to grant
+        access -- prefer it over is_approved() followed by a separate
+        cleanup() call, which is not atomic: see P1-1 in
+        AUDIT_REMEDIATION_AND_ADMIN_PLAN.md. An exclusive flock plus an
+        inode-staleness check (the same technique as
+        CodeManager._validate_locked()) means a losing racer can never
+        observe "approved" on a request another caller already consumed.
+
+        Args:
+            token: The approval token
+
+        Returns:
+            True if the approval was granted and has now been consumed
+            (the caller should treat this as success and not call
+            cleanup() again). False if not found, not yet approved, or
+            expired.
+        """
+        try:
+            approval_file = self._get_approval_file(token)
+        except ValueError:
+            return False
+
+        try:
+            fd = os.open(approval_file, os.O_RDWR)
+        except FileNotFoundError:
+            return False
+        except OSError as e:
+            if self.logger:
+                self.logger.error(f"Failed to open approval file: {e}")
+            return False
+
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                try:
+                    path_stat = os.stat(approval_file)
+                except FileNotFoundError:
+                    return False
+                fd_stat = os.fstat(fd)
+                if (path_stat.st_ino, path_stat.st_dev) != (
+                    fd_stat.st_ino,
+                    fd_stat.st_dev,
+                ):
+                    return False
+
+                try:
+                    raw = os.read(fd, 1 << 20)
+                    data = json.loads(raw.decode("utf-8"))
+                    if not isinstance(data, dict):
+                        raise ValueError("approval state is not an object")
+                except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+                    return False
+
+                expires = data.get("expires", 0)
+                if not isinstance(expires, (int, float)) or time.time() > expires:
+                    try:
+                        os.unlink(approval_file)
+                    except OSError:
+                        pass
+                    return False
+
+                if not data.get("approved", False):
+                    return False
+
+                try:
+                    os.unlink(approval_file)
+                except OSError:
+                    pass
+                return True
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
     def wait_for_approval(
         self, token: str, poll_interval: float = 1.0, timeout: Optional[int] = None
     ) -> bool:
@@ -1302,7 +1507,13 @@ class ApprovalManager:
         if timeout is None:
             timeout = self.timeout
 
-        start_time = time.time()
+        # monotonic(), not time(): this measures how long THIS process
+        # has been polling, which must not be affected by a wall-clock
+        # adjustment (NTP step, manual clock change) during the wait.
+        # The approval file's own "expires" field is compared elsewhere
+        # using wall-clock time, which is correct there since it's a
+        # cross-process, cross-time value.
+        start_time = time.monotonic()
 
         while True:
             # Check if approved
@@ -1314,7 +1525,7 @@ class ApprovalManager:
                 return False
 
             # Check overall timeout
-            if time.time() - start_time > timeout:
+            if time.monotonic() - start_time > timeout:
                 return False
 
             # Wait before next poll
@@ -1844,6 +2055,147 @@ class RateLimiter:
 
         return count
 
+    def _lease_file(self, user: str) -> str:
+        """Get the lease-list file path for a user (see reserve_request)."""
+        digest = hashlib.sha256(f"lease:{user}".encode()).hexdigest()[:16]
+        return os.path.join(self.storage_dir, f"lease_{digest}.json")
+
+    def reserve_request(
+        self,
+        user: str,
+        ttl_seconds: int,
+        limit: int,
+        now: Optional[float] = None,
+    ) -> Optional[str]:
+        """
+        Atomically reserve one outstanding-request slot for a user, or
+        refuse if the user is already at the concurrency cap.
+
+        This replaces the previous scan-then-create pattern (count how
+        many OTP/approval files exist, then separately create a new one)
+        that P0-2 in AUDIT_REMEDIATION_AND_ADMIN_PLAN.md found was a
+        check-then-act race: multiple PAM processes could all observe
+        "under the cap" and all proceed, since nothing reserved the slot
+        between the check and the file creation. Here, the prune/count/
+        reserve sequence happens under one exclusive flock on a single
+        per-user lease-list file, so the cap can never be exceeded no
+        matter how many processes race to reserve at once.
+
+        The caller must call generate()/create_approval() only AFTER a
+        successful reservation, and must call release_request() exactly
+        once when the attempt concludes (success, failure, error, or
+        cancellation) -- typically from a `finally` block. One lease
+        covers one authentication attempt regardless of auth_method, so
+        `both` (which creates both an OTP file and an approval file) is
+        counted once, not twice.
+
+        Args:
+            user: Username the reservation is scoped to
+            ttl_seconds: How long the lease is valid for if never
+                explicitly released (matches the OTP/approval timeout,
+                so an abandoned attempt -- e.g. a dropped SSH connection
+                -- stops counting once its own state would have expired
+                anyway)
+            limit: Maximum concurrent outstanding leases for this user
+            now: Override for the current time (used by tests)
+
+        Returns:
+            A lease ID to pass to release_request(), or None if the
+            user is already at the concurrency cap.
+        """
+        now = now if now is not None else time.time()
+        path = self._lease_file(user)
+
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                leases = self._read_leases(fd, now)
+
+                if len(leases) >= limit:
+                    if self.logger:
+                        self.logger.debug(
+                            "Concurrent-request cap reached",
+                            user=user,
+                            active=len(leases),
+                            limit=limit,
+                        )
+                    self._write_leases(fd, leases)
+                    return None
+
+                lease_id = secrets.token_urlsafe(16)
+                leases.append({"id": lease_id, "expires": now + ttl_seconds})
+                self._write_leases(fd, leases)
+                return lease_id
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def release_request(self, user: str, lease_id: str, now: Optional[float] = None):
+        """
+        Release a lease acquired by reserve_request().
+
+        Safe to call even if the lease already expired or the lease file
+        doesn't exist (e.g. this is the first call for a user). Must be
+        called exactly once per successful reserve_request() call,
+        typically from a `finally` block, so a completed or abandoned
+        attempt frees its slot for the next one.
+
+        Args:
+            user: Username the reservation was scoped to
+            lease_id: The lease ID returned by reserve_request()
+            now: Override for the current time (used by tests)
+        """
+        if not lease_id:
+            return
+        now = now if now is not None else time.time()
+        path = self._lease_file(user)
+
+        try:
+            fd = os.open(path, os.O_RDWR)
+        except FileNotFoundError:
+            return
+
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            try:
+                leases = self._read_leases(fd, now)
+                leases = [lease for lease in leases if lease.get("id") != lease_id]
+                self._write_leases(fd, leases)
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    @staticmethod
+    def _read_leases(fd: int, now: float) -> list:
+        """Read a lease-list file (already open+locked) and prune expired entries."""
+        os.lseek(fd, 0, os.SEEK_SET)
+        raw = os.read(fd, 1 << 16)
+        try:
+            leases = json.loads(raw.decode("utf-8")) if raw else []
+            if not isinstance(leases, list):
+                leases = []
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            leases = []
+        return [
+            lease
+            for lease in leases
+            if isinstance(lease, dict)
+            and isinstance(lease.get("expires"), (int, float))
+            and lease["expires"] > now
+        ]
+
+    @staticmethod
+    def _write_leases(fd: int, leases: list):
+        """Write a lease-list file (already open+locked) in place."""
+        encoded = json.dumps(leases).encode("utf-8")
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.ftruncate(fd, 0)
+        os.write(fd, encoded)
+        os.fsync(fd)
+
 
 # =============================================================================
 # PAM CONVERSATION HELPER
@@ -1883,7 +2235,7 @@ def pam_prompt(pamh, message: str, echo: bool = True) -> Optional[str]:
         # Response is a Response object, get the actual text
         return response.resp
 
-    except pamh.exception as e:
+    except pamh.exception:
         # PAM conversation failed (user cancelled, timeout, etc.)
         return None
 
@@ -2118,27 +2470,108 @@ def pam_sm_authenticate(pamh, flags, argv):
         pam_error(pamh, ratelimit_message)
         return PAM_MAXTRIES
 
+    # Reserve one outstanding-request slot before creating any code or
+    # approval state. reserve_request() replaces the previous
+    # count-active-then-create pattern, which P0-2 in
+    # AUDIT_REMEDIATION_AND_ADMIN_PLAN.md found was a check-then-act race
+    # (multiple PAM processes could all observe "under the cap" and all
+    # proceed). One lease covers the whole attempt regardless of
+    # auth_method, so "both" -- which creates an OTP file AND an approval
+    # file -- is counted once, not twice.
+    code_timeout = config.get("code_timeout", 300)
     max_concurrent = config.get("ratelimit_max_concurrent_per_user", 3)
-    pending = rate_limiter.count_active(
-        code_storage_dir, "code_", user
-    ) + rate_limiter.count_active(
-        os.path.join(code_storage_dir, "approvals"), "", user
-    )
-    if pending >= max_concurrent:
+    lease_id = rate_limiter.reserve_request(user, code_timeout, max_concurrent)
+    if lease_id is None:
         logger.warning(
             "Too many concurrent pending requests",
             user=user,
             rhost=rhost,
-            pending=pending,
             max_concurrent=max_concurrent,
         )
         pam_error(pamh, ratelimit_message)
         return PAM_MAXTRIES
 
+    # Everything from here on holds a reserved lease and may create
+    # code/approval state. cleanup_state is populated by
+    # _run_challenge() as it creates that state, so this outer finally
+    # can release the lease and best-effort clean up on EVERY exit path
+    # -- normal return, an early "return" inside _run_challenge, or an
+    # unhandled exception -- not just the paths that already had their
+    # own explicit cleanup call (see P0-3 in
+    # AUDIT_REMEDIATION_AND_ADMIN_PLAN.md).
+    cleanup_state = {}
+    try:
+        return _run_challenge(
+            pamh,
+            config,
+            logger,
+            user,
+            rhost,
+            auth_method,
+            user_config,
+            code_timeout,
+            code_storage_dir,
+            cleanup_state,
+        )
+    finally:
+        rate_limiter.release_request(user, lease_id)
+        _best_effort_cleanup(cleanup_state)
+
+
+def _best_effort_cleanup(cleanup_state: dict):
+    """
+    Safety-net cleanup for any code/approval state _run_challenge() left
+    behind on an exit path it didn't already handle explicitly (e.g. an
+    unexpected exception). See P0-3 in AUDIT_REMEDIATION_AND_ADMIN_PLAN.md.
+
+    Idempotent: CodeManager.cancel() and ApprovalManager.cleanup() are
+    both safe to call on state that's already been consumed/removed by
+    the normal code path, so calling this unconditionally is a harmless
+    no-op in the common case.
+
+    Args:
+        cleanup_state: Dict populated by _run_challenge() with whichever
+            of "code_manager"/"code_request_id" and
+            "approval_manager"/"approval_token" were created
+    """
+    code_manager = cleanup_state.get("code_manager")
+    code_request_id = cleanup_state.get("code_request_id")
+    if code_manager and code_request_id:
+        code_manager.cancel(code_request_id)
+
+    approval_manager = cleanup_state.get("approval_manager")
+    approval_token = cleanup_state.get("approval_token")
+    if approval_manager and approval_token:
+        approval_manager.cleanup(approval_token)
+
+
+def _run_challenge(
+    pamh,
+    config,
+    logger,
+    user,
+    rhost,
+    auth_method,
+    user_config,
+    code_timeout,
+    code_storage_dir,
+    cleanup_state,
+):
+    """
+    Steps 5-7 of pam_sm_authenticate(): generate credentials, send the
+    notification, and run the interactive challenge loop for the given
+    auth_method. Returns the final PAM_* return code.
+
+    Extracted into its own function so pam_sm_authenticate can wrap the
+    call in one try/finally that always releases the rate-limit lease
+    and cleans up request state (see P0-2/P0-3 in
+    AUDIT_REMEDIATION_AND_ADMIN_PLAN.md) -- including on an unhandled
+    exception, which no amount of per-branch cleanup inside this
+    function alone could guarantee.
+    """
     # -------------------------------------------------------------------------
     # Step 5: Setup managers and generate credentials
     # -------------------------------------------------------------------------
-    code_timeout = config.get("code_timeout", 300)
     code = None
     code_request_id = None
     approval_token = None
@@ -2161,6 +2594,8 @@ def pam_sm_authenticate(pamh, flags, argv):
             logger.error(f"Failed to generate code: {e}")
             pam_error(pamh, "Internal error. Please contact administrator.")
             return PAM_AUTHINFO_UNAVAIL
+        cleanup_state["code_manager"] = code_manager
+        cleanup_state["code_request_id"] = code_request_id
 
     # Approval manager (for "link" and "both" methods)
     approval_manager = None
@@ -2192,6 +2627,8 @@ def pam_sm_authenticate(pamh, flags, argv):
             logger.error(f"Failed to create approval: {e}")
             pam_error(pamh, "Internal error. Please contact administrator.")
             return PAM_AUTHINFO_UNAVAIL
+        cleanup_state["approval_manager"] = approval_manager
+        cleanup_state["approval_token"] = approval_token
 
     # -------------------------------------------------------------------------
     # Step 6: Send notification
@@ -2236,16 +2673,20 @@ def pam_sm_authenticate(pamh, flags, argv):
 
         poll_interval = 1.0  # Check every second
         max_wait = code_timeout
-        start_time = time.time()
+        # monotonic(), not time(): see ApprovalManager.wait_for_approval()
+        # -- this measures elapsed polling time in this one process and
+        # must not be affected by a wall-clock adjustment mid-wait.
+        start_time = time.monotonic()
 
         while True:
-            # Check if approved
-            if approval_manager.is_approved(approval_token):
+            # consume_approval() atomically checks-and-consumes in one
+            # locked step (see P1-1 in AUDIT_REMEDIATION_AND_ADMIN_PLAN.md)
+            # rather than a separate is_approved()+cleanup() pair.
+            if approval_manager.consume_approval(approval_token):
                 pam_info(
                     pamh, config.get("success_message", "Verification successful.")
                 )
                 logger.info("Authentication successful (link)", user=user, rhost=rhost)
-                approval_manager.cleanup(approval_token)
                 return PAM_SUCCESS
 
             # Check if expired
@@ -2255,7 +2696,7 @@ def pam_sm_authenticate(pamh, flags, argv):
                 return PAM_AUTH_ERR
 
             # Check overall timeout
-            if time.time() - start_time > max_wait:
+            if time.monotonic() - start_time > max_wait:
                 logger.warning("Approval timeout", user=user, rhost=rhost)
                 pam_error(pamh, "Approval timeout. Please try again.")
                 approval_manager.cleanup(approval_token)
@@ -2274,12 +2715,11 @@ def pam_sm_authenticate(pamh, flags, argv):
 
         for attempt in range(max_attempts):
             # Check if already approved via link before prompting
-            if approval_manager.is_approved(approval_token):
+            if approval_manager.consume_approval(approval_token):
                 pam_info(
                     pamh, config.get("success_message", "Verification successful.")
                 )
                 logger.info("Authentication successful (link)", user=user, rhost=rhost)
-                approval_manager.cleanup(approval_token)
                 return PAM_SUCCESS
 
             entered_code = pam_prompt(pamh, prompt_msg, echo=True)
@@ -2292,14 +2732,13 @@ def pam_sm_authenticate(pamh, flags, argv):
 
             # Empty input - check if link was clicked
             if entered_code.strip() == "":
-                if approval_manager.is_approved(approval_token):
+                if approval_manager.consume_approval(approval_token):
                     pam_info(
                         pamh, config.get("success_message", "Verification successful.")
                     )
                     logger.info(
                         "Authentication successful (link)", user=user, rhost=rhost
                     )
-                    approval_manager.cleanup(approval_token)
                     return PAM_SUCCESS
                 else:
                     if attempt < max_attempts - 1:
@@ -2322,14 +2761,13 @@ def pam_sm_authenticate(pamh, flags, argv):
                 return PAM_SUCCESS
             else:
                 # Check if link was approved while they were typing
-                if approval_manager.is_approved(approval_token):
+                if approval_manager.consume_approval(approval_token):
                     pam_info(
                         pamh, config.get("success_message", "Verification successful.")
                     )
                     logger.info(
                         "Authentication successful (link)", user=user, rhost=rhost
                     )
-                    approval_manager.cleanup(approval_token)
                     return PAM_SUCCESS
 
                 if attempt < max_attempts - 1:

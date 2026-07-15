@@ -27,7 +27,7 @@ The safest sequence is:
 5. Package it and provide a transactional installer.
 6. Run a controlled migration and security review.
 
-## Status (re-audited 2026-07-14)
+## Status (re-audited 2026-07-14; Phase 0/1 remediation landed same day)
 
 > **Deep-audit correction:** the first status pass overstated completion.
 > Deterministic concurrency probes proved that one OTP can validate twice and
@@ -37,25 +37,33 @@ The safest sequence is:
 > [AUDIT_REMEDIATION_AND_ADMIN_PLAN.md](AUDIT_REMEDIATION_AND_ADMIN_PLAN.md)
 > for evidence, the complete finding set, native Pushover/ntfy direction, and
 > the user-administration CLI plan.
+>
+> **Update, same day:** that plan's Phase 0 (failing regression tests) and
+> Phase 1 (request-state atomicity, config, secret/logging handling) have
+> now landed -- see the `[FIXED]`/`[PARTIAL]` tags on individual findings
+> in `AUDIT_REMEDIATION_AND_ADMIN_PLAN.md`. The installer (P0-6) and
+> PAM/SSH alternatives (P0-7) findings below are **not** part of that
+> work -- they're explicitly Phase 2 in the audit plan's own sequencing
+> and remain open.
 
-Phase 1 (stabilize the current Python implementation) is **not complete**.
-The first implementation pass fixed important surface issues, but the deeper
-audit reopened atomicity, flood-control, bearer-secret, installer, and PAM
-guidance work. Every finding below is tagged with its corrected status.
+Phase 1 (stabilize the current Python implementation) is **substantially
+complete for the request-state/config/secret-logging findings**; the
+installer and PAM/SSH-alternatives findings remain reopened pending Phase 2.
+Every finding below is tagged with its corrected status.
 
 | Finding | Status |
 |---|---|
 | Critical: approval token handling is inconsistent | **FIXED** |
 | Critical: a GET request approves an SSH login | **FIXED** |
-| High: approval links are bearer credentials | **PARTIAL** -- public HTTP is rejected, but debug HTTP logging includes full approval-token paths and private/non-global HTTP is trusted too broadly |
+| High: approval links are bearer credentials | **PARTIAL** -- public HTTP is rejected, and debug HTTP logging no longer includes approval-token paths, but private/non-global HTTP is still trusted more broadly than ideal and there's no general secret-redaction helper yet |
 | High: unescaped values are inserted into HTML | **FIXED** |
-| High: OTP requests can overwrite each other | **PARTIAL** -- unique request IDs prevent cross-request overwrite, but same-request validation/attempt transitions are not atomic and one OTP can validate twice |
-| High: four-digit OTPs and notification flooding | **PARTIAL** -- six-digit default and sliding windows work, but the concurrent cap is a check-then-create race and `both` counts one attempt twice |
-| High: the documented PAM stack may not match the promised flow | **PARTIAL** -- the primary flow is verified on Debian 13, but optional/group/password alternatives are incorrect and Ubuntu/older Debian remain unverified |
+| High: OTP requests can overwrite each other | **FIXED** -- unique request IDs prevent cross-request overwrite, and validation is now atomic (flock + inode-staleness check across the whole read/check/update/delete transition); a barrier-forced concurrent-validation test that used to yield 2 successes out of 20 now reliably yields exactly 1 |
+| High: four-digit OTPs and notification flooding | **FIXED** -- six-digit default, sliding windows, and the concurrent-request cap is now an atomic reservation (`RateLimiter.reserve_request`/`release_request`) instead of a check-then-create race; `both` now reserves one lease, not two |
+| High: the documented PAM stack may not match the promised flow | **PARTIAL, unchanged by this update** -- the primary flow is verified on Debian 13, but optional/group/password alternatives are incorrect and Ubuntu/older Debian remain unverified; this is Phase 2 work |
 | Medium: the approval service runs as root | **OPEN** -- not started |
-| Medium: the installer exists but leaves risky work manual | **PARTIAL / REOPENED** -- see corrected breakdown below |
+| Medium: the installer exists but leaves risky work manual | **PARTIAL / REOPENED, unchanged by this update** -- see corrected breakdown below; this is Phase 2 work |
 | Medium: implementation responsibilities are too concentrated | **OPEN** -- deferred to the Go rewrite (Phases 2-4), not started |
-| Medium: there is no automated test suite | **FIXED as an existence finding** -- 52 tests pass across 8 actual automated test modules, plus a manual utility named `test_notify.py`; important race, lifecycle, provider, and installer coverage is still missing |
+| Medium: there is no automated test suite | **FIXED as an existence finding** -- 63 tests pass across 9 automated test modules (added `test_atomicity_regressions.py`), plus a manual utility renamed to `notify_check.py` so it's no longer swept up by test discovery; installer and multi-OS PAM coverage is still missing |
 
 **"The installer exists but leaves risky work manual" breakdown:**
 
@@ -70,9 +78,12 @@ guidance work. Every finding below is tagged with its corrected status.
 | No transactional rollback | **OPEN** -- uninstall is not precise restoration: it deletes recorded backups; there is no failed-upgrade rollback transaction |
 | Doesn't validate end-to-end PAM auth before activation | **PARTIAL** -- clear `pamtester` verification steps are now printed/documented; not run automatically by the installer |
 
-Immediate/Next items from "Suggested priority order" are **not all fixed**.
-The next work must return to Phase 1 and complete the reopened items before the
-Go daemon or administration feature expands the attack surface.
+Immediate/Next items from "Suggested priority order" are **mostly fixed now**
+for request-state atomicity, configuration, and secret-logging; the
+installer-restoration and PAM/SSH-alternatives items are not, and are
+explicitly Phase 2 in `AUDIT_REMEDIATION_AND_ADMIN_PLAN.md`'s sequencing.
+The next work should pick up Phase 2 there before the Go daemon or
+administration feature expands the attack surface.
 
 ## Repository findings
 
@@ -476,19 +487,19 @@ Goal: replace the Python implementation without risking lockout or changed polic
 
 ## Suggested priority order
 
-### Immediate [REOPENED AFTER DEEP AUDIT]
+### Immediate [MOSTLY FIXED after Phase 0/1 remediation]
 
 - Fix link token lookup. **FIXED**
 - Prevent GET/link-preview approval. **FIXED**
-- Require explicit HTTPS guidance. **PARTIAL** -- transport gate exists; token logging/private-HTTP policy still need work
+- Require explicit HTTPS guidance. **PARTIAL** -- transport gate exists and token logging is fixed; private-HTTP policy breadth still needs work
 - Escape approval-page fields. **FIXED**
-- Add unique request IDs and atomic one-time consumption. **PARTIAL** -- IDs fixed; consumption is not atomic
+- Add unique request IDs and atomic one-time consumption. **FIXED** -- both OTP validation (`CodeManager._validate_locked`) and approval consumption (`ApprovalManager.consume_approval`) are now atomic under flock + inode-staleness checks
 
 ### Next [PARTIAL / REOPENED]
 
-- Add tests and rate limiting. **PARTIAL** -- suite and window limits exist; active-request reservation races and coverage gaps remain
-- Correct and test the PAM/SSH configuration guidance. **PARTIAL** -- primary Debian 13 flow only; alternatives and other platforms remain
-- Improve the existing installer's validation and rollback behavior. **PARTIAL / INCORRECT** -- the manifest records backups but uninstall deletes rather than restores them
+- Add tests and rate limiting. **FIXED** -- suite now 63 tests; the active-request cap is an atomic reservation (`RateLimiter.reserve_request`/`release_request`), no longer a check-then-create race
+- Correct and test the PAM/SSH configuration guidance. **PARTIAL, unchanged** -- primary Debian 13 flow only; alternatives and other platforms remain (Phase 2)
+- Improve the existing installer's validation and rollback behavior. **PARTIAL / INCORRECT, unchanged** -- the manifest records backups but uninstall deletes rather than restores them (Phase 2)
 
 ### Then [NOT STARTED]
 

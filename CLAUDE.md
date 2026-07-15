@@ -19,7 +19,7 @@ pam-ssh-2fa/
 |-- approval_server.py      # HTTP server for link-based auth (~950 lines)
 |-- config.ini              # Global configuration (~400 lines)
 |-- install.sh              # Installation script (~1020 lines)
-|-- test_notify.py          # Notification testing utility (~320 lines)
+|-- notify_check.py         # Notification testing utility (~320 lines)
 |-- cleanup_codes.py        # Expired code cleanup utility (~210 lines)
 |-- pam-ssh-2fa-server.service  # Systemd service for approval server
 |-- README.md               # User documentation (~790 lines)
@@ -289,6 +289,51 @@ actual `pam_python.so` entry point, not just the Python API, and is the
 only test in this repo that would catch a regression of either finding
 above.
 
+### Validated: Request-State Atomicity
+
+Per AUDIT_REMEDIATION_AND_ADMIN_PLAN.md's P0-1/P0-2/P0-3/P1-1 findings, a
+deep concurrency re-audit forced races that let one OTP validate twice
+and let 5 requests pass a concurrent cap of 1. Both are fixed, and both
+fixes follow the same pattern -- know it before touching either class:
+
+1. **Every state transition that must happen exactly once holds an
+   exclusive `flock()` across its ENTIRE read-check-update/delete
+   sequence, not just around individual reads or writes.**
+   `CodeManager._validate_locked()` and
+   `ApprovalManager.consume_approval()` both do this. Splitting a
+   transition into separate locked steps (e.g. "check if approved" then,
+   later, "delete it") reopens the same race the fix was for.
+2. **A losing racer must not trust data read via an fd it opened before
+   losing the race.** `unlink()` doesn't invalidate an already-open fd,
+   so after acquiring the lock, compare `os.fstat(fd)` against
+   `os.stat(path)` -- a mismatch means another caller already
+   consumed/replaced this state, even though the read would otherwise
+   look valid.
+3. **The concurrent-request cap is a reservation, not a scan.**
+   `RateLimiter.reserve_request()`/`release_request()` hold a per-user
+   lock across prune-count-reserve in one critical section. Do not
+   reintroduce a "count files, then create one" pattern for any new cap
+   -- that's exactly the check-then-act race this replaced. One lease
+   covers one authentication attempt regardless of `auth_method`
+   (`code`/`link`/`both` all reserve exactly once).
+4. **`pam_sm_authenticate()`'s Steps 5-7 live in `_run_challenge()`,
+   called from one outer `try/finally`** that releases the rate-limit
+   lease and runs `_best_effort_cleanup()` on every exit path, including
+   an unhandled exception. `_run_challenge()` populates the
+   `cleanup_state` dict as it creates code/approval state specifically
+   so this outer boundary can find it. If you add a new way to exit
+   `_run_challenge()` early, you do not need to add manual cleanup for
+   it -- the outer `finally` already covers it -- but you must still
+   register newly created state into `cleanup_state` if you add a new
+   kind of request state.
+
+If you ever touch `CodeManager.validate()`, `ApprovalManager.consume_approval()`,
+`RateLimiter.reserve_request()`/`release_request()`, or the
+`pam_sm_authenticate()`/`_run_challenge()` split, run
+`test_atomicity_regressions.py` -- it's the regression suite for all
+four findings above (concurrent-validation, cap-reservation,
+approval-consumption, and cleanup-on-notification-failure tests).
+
 ## Code Conventions
 
 ### Accessibility
@@ -377,7 +422,7 @@ above.
    should change (these bound what config.ini can set -- see `_bounded_int`)
 4. Update config.ini `length = X`
 5. Update all documentation references (README, config comments)
-6. Update test code examples (test_notify.py, docstrings)
+6. Update test code examples (notify_check.py, docstrings)
 
 ### Changing Approval Server URL/TLS Rules
 
@@ -404,10 +449,10 @@ The HTTPS requirement is split across two files -- keep both in sync:
 python3 /etc/pam-ssh-2fa/pam_ssh_2fa.py --test-notify
 
 # Test specific user
-python3 /etc/pam-ssh-2fa/test_notify.py --user doug
+python3 /etc/pam-ssh-2fa/notify_check.py --user doug
 
 # Test specific URL
-python3 /etc/pam-ssh-2fa/test_notify.py --url "ntfy://ntfy.sh/test"
+python3 /etc/pam-ssh-2fa/notify_check.py --url "ntfy://ntfy.sh/test"
 ```
 
 ### Test PAM Module Without SSH
@@ -467,7 +512,7 @@ python3 /etc/pam-ssh-2fa/pam_ssh_2fa.py
 |------|-------------------|
 | pam_ssh_2fa.py | /etc/pam-ssh-2fa/pam_ssh_2fa.py |
 | approval_server.py | /etc/pam-ssh-2fa/approval_server.py (only if `--enable-link-approval`) |
-| test_notify.py | /etc/pam-ssh-2fa/test_notify.py |
+| notify_check.py | /etc/pam-ssh-2fa/notify_check.py |
 | cleanup_codes.py | /etc/pam-ssh-2fa/cleanup_codes.py |
 | config.ini | /etc/pam-ssh-2fa/config.ini |
 | Per-user configs | /etc/pam-ssh-2fa/users/*.conf |

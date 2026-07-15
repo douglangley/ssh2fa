@@ -336,7 +336,7 @@ install_module() {
     # Utility scripts referenced by the README/CLAUDE.md but historically
     # not installed: manual notification testing and cron-driven cleanup
     # of expired OTP state.
-    for util_file in test_notify.py cleanup_codes.py; do
+    for util_file in notify_check.py cleanup_codes.py; do
         if [[ -f "${SCRIPT_DIR}/${util_file}" ]]; then
             install_tracked_file "${SCRIPT_DIR}/${util_file}" "${INSTALL_DIR}/${util_file}" 755
             success "Installed ${util_file}"
@@ -461,7 +461,7 @@ verify_installation() {
     fi
 
     # Check utility scripts
-    for util_file in test_notify.py cleanup_codes.py; do
+    for util_file in notify_check.py cleanup_codes.py; do
         if [[ -f "${INSTALL_DIR}/${util_file}" ]]; then
             success "${util_file} installed"
         else
@@ -795,7 +795,7 @@ uninstall_legacy_fallback() {
     info "Removing module files..."
     run rm -f "${INSTALL_DIR}/${MODULE_FILE}"
     run rm -f "${INSTALL_DIR}/approval_server.py"
-    run rm -f "${INSTALL_DIR}/test_notify.py"
+    run rm -f "${INSTALL_DIR}/notify_check.py"
     run rm -f "${INSTALL_DIR}/cleanup_codes.py"
     success "Removed module files"
 

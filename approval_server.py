@@ -92,7 +92,6 @@ import re
 import secrets
 import tempfile
 import ssl
-from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional, Tuple
 
@@ -281,7 +280,12 @@ class ServerConfig:
         if not os.path.exists(config_file):
             return
 
-        parser = configparser.ConfigParser()
+        # interpolation=None: see the matching comment in
+        # pam_ssh_2fa.Config._parse_config_file -- a percent-encoded
+        # notification/server URL is valid INI content but can trip
+        # configparser's default interpolation (P0-4 in
+        # AUDIT_REMEDIATION_AND_ADMIN_PLAN.md).
+        parser = configparser.ConfigParser(interpolation=None)
         try:
             parser.read(config_file)
         except configparser.Error:
@@ -519,9 +523,21 @@ class ApprovalRequestHandler(BaseHTTPRequestHandler):
     The handler accesses the ApprovalManager via server.approval_manager.
     """
 
-    # Suppress default logging (we do our own)
+    # Suppress default logging (we do our own). Deliberately does NOT log
+    # args[0] (the raw request line) -- BaseHTTPRequestHandler passes the
+    # full "METHOD /approve/<bearer-token> HTTP/1.1" line there, which
+    # would put the approval token in the log file on every request when
+    # debug logging is enabled (see P0-5 in
+    # AUDIT_REMEDIATION_AND_ADMIN_PLAN.md). Log only the method and a
+    # redacted route instead.
     def log_message(self, format, *args):
-        logging.debug(f"HTTP: {args[0]}")
+        try:
+            route = urlparse(self.path).path
+        except (ValueError, AttributeError):
+            route = "?"
+        if route.startswith("/approve/"):
+            route = "/approve/<redacted>"
+        logging.debug(f"HTTP {self.command} {route}")
 
     def _send_html(self, status: int, html: str):
         """Send an HTML response."""
@@ -919,7 +935,7 @@ Examples:
         cleanup_thread.stop()
         sys.exit(1)
 
-    logging.info(f"PAM SSH 2FA Approval Server starting")
+    logging.info("PAM SSH 2FA Approval Server starting")
     scheme = "https" if server.tls_enabled else "http"
     logging.info(f"Listening on {scheme}://{config.bind_address}:{config.port}")
     if not server.tls_enabled:
